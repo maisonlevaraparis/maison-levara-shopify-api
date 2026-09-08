@@ -21,27 +21,30 @@ const OPENAI_API_KEY =
   process.env.OPENAI_API_KEY;
 
 const OPENAI_MODEL =
-  process.env.OPENAI_MODEL ||
-  "gpt-5-mini";
+  process.env.OPENAI_MODEL || "gpt-5-mini";
 
-const SHOPIFY_SCOPES =
-  "write_products,write_files";
-
-const TOKEN_FILE =
-  process.env.TOKEN_FILE ||
-  path.join(
-    "/tmp",
-    "maison-levara-shopify-tokens.json"
+const TRANSLATION_CONCURRENCY =
+  Math.max(
+    1,
+    Math.min(
+      3,
+      Number(
+        process.env.TRANSLATION_CONCURRENCY || 1
+      )
+    )
   );
 
-const oauthStates =
-  new Map();
+const SHOPIFY_SCOPES =
+  "write_products";
 
-const sessions =
-  new Map();
+const TOKEN_FILE = path.join(
+  "/tmp",
+  "maison-levara-shopify-tokens.json"
+);
 
-const tokens =
-  loadTokens();
+const oauthStates = new Map();
+const sessions = new Map();
+const tokens = loadTokens();
 
 const job = {
   running: false,
@@ -65,7 +68,7 @@ const job = {
 
 app.use(
   express.json({
-    limit: "12mb",
+    limit: "15mb",
   })
 );
 
@@ -81,24 +84,21 @@ app.use(
 
 function sleep(ms) {
   return new Promise(
-    (resolve) =>
-      setTimeout(resolve, ms)
+    (resolve) => setTimeout(resolve, ms)
   );
 }
 
 function validShop(shop) {
   return (
     typeof shop === "string" &&
-    /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i.test(
+    /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/.test(
       shop
     )
   );
 }
 
 function normalize(value) {
-  return String(
-    value || ""
-  )
+  return String(value || "")
     .normalize("NFD")
     .replace(
       /[\u0300-\u036f]/g,
@@ -142,16 +142,15 @@ function loadTokens() {
       return new Map();
     }
 
-    const parsed =
-      JSON.parse(
-        fs.readFileSync(
-          TOKEN_FILE,
-          "utf8"
-        )
-      );
-
     return new Map(
-      Object.entries(parsed)
+      Object.entries(
+        JSON.parse(
+          fs.readFileSync(
+            TOKEN_FILE,
+            "utf8"
+          )
+        )
+      )
     );
   } catch {
     return new Map();
@@ -232,7 +231,10 @@ function parseCookies(req) {
   return result;
 }
 
-function createSession(shop) {
+function setSessionCookie(
+  res,
+  shop
+) {
   const id =
     crypto.randomBytes(
       32
@@ -251,16 +253,6 @@ function createSession(shop) {
           1000,
     }
   );
-
-  return id;
-}
-
-function setSessionCookie(
-  res,
-  shop
-) {
-  const id =
-    createSession(shop);
 
   res.setHeader(
     "Set-Cookie",
@@ -292,6 +284,7 @@ function getSessionShop(req) {
     Date.now()
   ) {
     sessions.delete(id);
+
     return null;
   }
 
@@ -302,7 +295,9 @@ function getSessionShop(req) {
    SHOPIFY HMAC
 ========================================================= */
 
-function verifyHmac(query) {
+function verifyShopifyHmac(
+  query
+) {
   const {
     hmac,
     ...params
@@ -400,7 +395,17 @@ async function shopifyGraphQL(
       ) {
         lastError =
           new Error(
-            "Shopify rate limit."
+            `Shopify rate limit: ${
+              body?.errors
+                ?.map(
+                  (e) =>
+                    e.message
+                )
+                .join(
+                  " | "
+                ) ||
+              ""
+            }`
           );
 
         await sleep(
@@ -493,22 +498,25 @@ async function shopifyGraphQL(
 }
 
 /* =========================================================
-   PRODUCT QUERY
+   PRODUCTS
 ========================================================= */
 
 const PRODUCTS_QUERY = `
   query GetProducts($after: String) {
+
     products(
       first: 100
       after: $after
     ) {
+
       nodes {
+
         id
         legacyResourceId
 
         title
         handle
-        productType
+
         descriptionHtml
 
         seo {
@@ -517,6 +525,7 @@ const PRODUCTS_QUERY = `
         }
 
         options {
+
           id
           name
           position
@@ -535,7 +544,7 @@ const PRODUCTS_QUERY = `
         }
 
         media(
-          first: 250
+          first: 100
         ) {
           nodes {
             id
@@ -567,11 +576,12 @@ const PRODUCTS_QUERY = `
 
 async function getAllProducts(
   shop,
-  accessToken
+  token
 ) {
   const products = [];
 
-  let after = null;
+  let after =
+    null;
 
   while (
     true
@@ -579,7 +589,7 @@ async function getAllProducts(
     const data =
       await shopifyGraphQL(
         shop,
-        accessToken,
+        token,
         PRODUCTS_QUERY,
         {
           after,
@@ -608,459 +618,364 @@ async function getAllProducts(
 }
 
 /* =========================================================
-   DONE MARKER
+   BF SIZE CHART
 ========================================================= */
 
-function isDone(product) {
-  return product.metafields.nodes.some(
-    (field) =>
-      field.namespace ===
-        "maison_levara" &&
-      field.key ===
-        "fr_translation_v1" &&
-      field.value ===
-        "done"
-  );
-}
+const BF_QUERY = `
+  query BFSizeCharts {
 
-async function markDone(
-  shop,
-  token,
-  productId
-) {
-  const mutation = `
-    mutation MarkProductDone(
-      $metafields: [MetafieldsSetInput!]!
-    ) {
-      metafieldsSet(
-        metafields: $metafields
+    shop {
+
+      id
+
+      metafield(
+        namespace: "sizechartsrelentless"
+        key: "size_charts"
       ) {
-        userErrors {
-          field
-          message
-          code
-        }
+
+        id
+        namespace
+        key
+        type
+        value
+        compareDigest
+
       }
     }
-  `;
+  }
+`;
 
+async function getBFSizeCharts(
+  shop,
+  token
+) {
   const data =
     await shopifyGraphQL(
       shop,
       token,
-      mutation,
-      {
-        metafields: [
-          {
-            ownerId:
-              productId,
-
-            namespace:
-              "maison_levara",
-
-            key:
-              "fr_translation_v1",
-
-            type:
-              "single_line_text_field",
-
-            value:
-              "done",
-          },
-        ],
-      }
-    );
-
-  const errors =
-    data.metafieldsSet
-      .userErrors || [];
-
-  if (
-    errors.length
-  ) {
-    throw new Error(
-      errors
-        .map(
-          (error) =>
-            error.message
-        )
-        .join(" | ")
-    );
-  }
-}
-
-/* =========================================================
-   HTML PROTECTION
-========================================================= */
-
-function protectHtml(
-  html
-) {
-  const tags = [];
-  const attributes = [];
-  const rawBlocks = [];
-
-  let source =
-    String(
-      html || ""
-    );
-
-  source =
-    source.replace(
-      /<(script|style)\b[\s\S]*?<\/\1>/gi,
-      (block) => {
-        const token =
-          `___ML_RAW_${String(
-            rawBlocks.length
-          ).padStart(
-            5,
-            "0"
-          )}___`;
-
-        rawBlocks.push({
-          token,
-          block,
-        });
-
-        return token;
-      }
-    );
-
-  source =
-    source.replace(
-      /<[^>]*>/g,
-      (tag) => {
-        let protectedTag =
-          tag;
-
-        protectedTag =
-          protectedTag.replace(
-            /\b(alt|title|href|src)\s*=\s*(["'])([\s\S]*?)\2/gi,
-            (
-              full,
-              name,
-              quote,
-              value
-            ) => {
-              const id =
-                attributes.length;
-
-              const token =
-                `___ML_ATTR_${String(
-                  id
-                ).padStart(
-                  5,
-                  "0"
-                )}___`;
-
-              attributes.push({
-                id,
-                name:
-                  name.toLowerCase(),
-
-                value,
-
-                translatable:
-                  /^(alt|title)$/i.test(
-                    name
-                  ),
-              });
-
-              return `${name}=${quote}${token}${quote}`;
-            }
-          );
-
-        const token =
-          `___ML_TAG_${String(
-            tags.length
-          ).padStart(
-            5,
-            "0"
-          )}___`;
-
-        tags.push({
-          token,
-          tag:
-            protectedTag,
-        });
-
-        return token;
-      }
+      BF_QUERY
     );
 
   return {
-    html:
-      source,
+    shopId:
+      data.shop.id,
 
-    tags,
-
-    attributes,
-
-    rawBlocks,
+    metafield:
+      data.shop.metafield,
   };
 }
 
-function restoreHtml(
-  translated,
-  prepared,
-  translatedAttributes
+/* =========================================================
+   BF JSON HELPERS
+========================================================= */
+
+function shouldSkipBFString(
+  key,
+  value
 ) {
-  let html =
+  const k =
     String(
-      translated || ""
-    );
+      key || ""
+    ).toLowerCase();
 
-  const attrMap =
-    new Map(
-      (
-        translatedAttributes ||
-        []
-      ).map(
-        (item) => [
-          Number(
-            item.id
-          ),
-          String(
-            item.value ||
-              ""
-          ),
-        ]
-      )
-    );
+  const v =
+    String(
+      value || ""
+    ).trim();
 
-  function escapeAttribute(
-    value
-  ) {
-    return String(
-      value
-    )
-      .replace(
-        /&/g,
-        "&amp;"
-      )
-      .replace(
-        /"/g,
-        "&quot;"
-      )
-      .replace(
-        /</g,
-        "&lt;"
-      )
-      .replace(
-        />/g,
-        "&gt;"
-      );
-  }
-
-  for (
-    const item of
-      prepared.tags
-  ) {
-    if (
-      html.split(
-        item.token
-      ).length -
-        1 !==
-      1
-    ) {
-      throw new Error(
-        `HTML-tag ${item.token} ontbreekt of is dubbel.`
-      );
-    }
-
-    let restoredTag =
-      item.tag;
-
-    for (
-      const attribute of
-        prepared.attributes
-    ) {
-      const token =
-        `___ML_ATTR_${String(
-          attribute.id
-        ).padStart(
-          5,
-          "0"
-        )}___`;
-
-      if (
-        !restoredTag.includes(
-          token
-        )
-      ) {
-        continue;
-      }
-
-      let value =
-        attribute.value;
-
-      if (
-        attribute.translatable &&
-        attrMap.has(
-          attribute.id
-        )
-      ) {
-        value =
-          attrMap.get(
-            attribute.id
-          );
-      }
-
-      restoredTag =
-        restoredTag.replace(
-          token,
-          escapeAttribute(
-            value
-          )
-        );
-    }
-
-    if (
-      /___ML_ATTR_\d{5}___/.test(
-        restoredTag
-      )
-    ) {
-      throw new Error(
-        "HTML-attribuut placeholder ontbreekt."
-      );
-    }
-
-    html =
-      html.replace(
-        item.token,
-        restoredTag
-      );
-  }
-
-  for (
-    const raw of
-      prepared.rawBlocks
-  ) {
-    if (
-      html.split(
-        raw.token
-      ).length -
-        1 !==
-      1
-    ) {
-      throw new Error(
-        "Beschermd HTML-blok ontbreekt."
-      );
-    }
-
-    html =
-      html.replace(
-        raw.token,
-        raw.block
-      );
+  if (!v) {
+    return true;
   }
 
   if (
-    /___ML_(TAG|ATTR|RAW)_\d{5}___/.test(
-      html
+    /^(https?:\/\/|mailto:|tel:)/i.test(
+      v
     )
   ) {
-    throw new Error(
-      "Onopgeloste HTML placeholder gevonden."
-    );
+    return true;
   }
 
-  return html;
-}
+  if (
+    /^gid:\/\//i.test(
+      v
+    )
+  ) {
+    return true;
+  }
 
-function htmlTagList(
-  html
-) {
-  return [
-    ...String(
-      html || ""
-    ).matchAll(
-      /<\s*(\/?)\s*([a-zA-Z0-9]+)/g
-    ),
-  ].map(
-    (match) =>
-      `${match[1] ? "/" : ""}${match[2].toLowerCase()}`
+  if (
+    /^[a-f0-9]{16,}$/i.test(
+      v
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    /^#[0-9a-f]{3,8}$/i.test(
+      v
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    /^\d+(?:[.,]\d+)?$/.test(
+      v
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    /^\d+(?:[.,]\d+)?\s*(cm|mm|m|kg|g|lb|lbs|in|inch|inches|%|°c|°f)$/i.test(
+      v
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    /^\d+\s*[-–]\s*\d+$/.test(
+      v
+    )
+  ) {
+    return true;
+  }
+
+  const technicalKeys = [
+    "id",
+    "key",
+    "type",
+    "namespace",
+    "handle",
+    "url",
+    "href",
+    "src",
+    "class",
+    "classname",
+    "operator",
+    "field",
+    "language",
+    "locale",
+    "countrycode",
+    "fontfamily",
+    "fontsize",
+    "fontweight",
+    "bordercolor",
+    "backgroundcolor",
+    "textcolor",
+    "color",
+    "hex",
+    "productid",
+    "collectionid",
+    "shopid",
+    "variantid",
+    "createdat",
+    "updatedat",
+  ];
+
+  return technicalKeys.includes(
+    k
   );
 }
 
-function htmlUrlList(
-  html
+function replaceKnownProductTitles(
+  node,
+  titleMap
 ) {
-  return [
-    ...String(
-      html || ""
-    ).matchAll(
-      /\b(?:href|src)\s*=\s*["']([^"']+)["']/gi
-    ),
-  ]
-    .map(
-      (match) =>
-        match[1]
+  if (
+    Array.isArray(node)
+  ) {
+    for (
+      let i = 0;
+      i < node.length;
+      i++
+    ) {
+      node[i] =
+        replaceKnownProductTitles(
+          node[i],
+          titleMap
+        );
+    }
+
+    return node;
+  }
+
+  if (
+    !node ||
+    typeof node !==
+      "object"
+  ) {
+    if (
+      typeof node ===
+      "string"
+    ) {
+      const mapped =
+        titleMap.get(
+          normalize(node)
+        );
+
+      return (
+        mapped ||
+        node
+      );
+    }
+
+    return node;
+  }
+
+  for (
+    const [
+      key,
+      value
+    ] of Object.entries(
+      node
     )
-    .sort();
+  ) {
+    if (
+      typeof value ===
+      "string"
+    ) {
+      const mapped =
+        titleMap.get(
+          normalize(value)
+        );
+
+      if (
+        mapped
+      ) {
+        node[key] =
+          mapped;
+      }
+    } else {
+      node[key] =
+        replaceKnownProductTitles(
+          value,
+          titleMap
+        );
+    }
+  }
+
+  return node;
 }
 
-function assertHtmlSafe(
-  before,
-  after
+function collectBFTextEntries(
+  node,
+  entries = [],
+  currentPath = [],
+  protectedStrings = new Set()
 ) {
-  const beforeTags =
-    htmlTagList(
-      before
-    );
-
-  const afterTags =
-    htmlTagList(
-      after
-    );
-
   if (
-    beforeTags.length !==
-      afterTags.length ||
-    beforeTags.some(
+    Array.isArray(node)
+  ) {
+    node.forEach(
       (
-        value,
+        item,
         index
       ) =>
-        value !==
-        afterTags[index]
+        collectBFTextEntries(
+          item,
+          entries,
+          currentPath.concat(
+            index
+          ),
+          protectedStrings
+        )
+    );
+
+    return entries;
+  }
+
+  if (
+    !node ||
+    typeof node !==
+      "object"
+  ) {
+    return entries;
+  }
+
+  for (
+    const [
+      key,
+      value
+    ] of Object.entries(
+      node
     )
   ) {
-    throw new Error(
-      "HTML-tagstructuur is gewijzigd."
+    const nextPath =
+      currentPath.concat(
+        key
+      );
+
+    if (
+      typeof value ===
+      "string"
+    ) {
+      if (
+        !protectedStrings.has(
+          normalize(
+            value
+          )
+        ) &&
+        !shouldSkipBFString(
+          key,
+          value
+        )
+      ) {
+        entries.push({
+          path:
+            nextPath,
+
+          text:
+            value,
+        });
+      }
+
+      continue;
+    }
+
+    collectBFTextEntries(
+      value,
+      entries,
+      nextPath,
+      protectedStrings
     );
   }
 
-  const beforeUrls =
-    htmlUrlList(
-      before
-    );
+  return entries;
+}
 
-  const afterUrls =
-    htmlUrlList(
-      after
-    );
+function setDeep(
+  root,
+  parts,
+  value
+) {
+  let current =
+    root;
 
-  if (
-    beforeUrls.length !==
-      afterUrls.length ||
-    beforeUrls.some(
-      (
-        value,
-        index
-      ) =>
-        value !==
-        afterUrls[index]
-    )
+  for (
+    let i = 0;
+    i <
+      parts.length - 1;
+    i++
   ) {
-    throw new Error(
-      "Een product-URL in de HTML is gewijzigd."
-    );
+    current =
+      current[
+        parts[i]
+      ];
   }
+
+  current[
+    parts[
+      parts.length - 1
+    ]
+  ] =
+    value;
 }
 
 /* =========================================================
-   FRENCH NAMES
+   FRENCH NAME LIST
 ========================================================= */
 
 const FRENCH_NAMES = [
@@ -1175,6 +1090,333 @@ const FRENCH_NAME_KEYS =
   );
 
 /* =========================================================
+   HTML PROTECTION
+========================================================= */
+
+function protectHtml(
+  html
+) {
+  const tags = [];
+  const attributes = [];
+
+  let source =
+    String(
+      html || ""
+    );
+
+  source =
+    source.replace(
+      /<[^>]*>/g,
+      (tag) => {
+        let safeTag =
+          tag;
+
+        safeTag =
+          safeTag.replace(
+            /\b(alt|title|href|src)\s*=\s*(["'])([\s\S]*?)\2/gi,
+            (
+              full,
+              name,
+              quote,
+              value
+            ) => {
+              const id =
+                attributes.length;
+
+              const token =
+                `___ML_ATTR_${String(
+                  id
+                ).padStart(
+                  5,
+                  "0"
+                )}___`;
+
+              attributes.push({
+                id,
+
+                name:
+                  name.toLowerCase(),
+
+                value,
+
+                translatable:
+                  /^(alt|title)$/i.test(
+                    name
+                  ),
+              });
+
+              return (
+                `${name}=${quote}${token}${quote}`
+              );
+            }
+          );
+
+        const token =
+          `___ML_TAG_${String(
+            tags.length
+          ).padStart(
+            5,
+            "0"
+          )}___`;
+
+        tags.push({
+          token,
+
+          tag:
+            safeTag,
+        });
+
+        return token;
+      }
+    );
+
+  return {
+    html:
+      source,
+
+    tags,
+
+    attributes,
+  };
+}
+
+function restoreHtml(
+  translated,
+  prepared,
+  translatedAttributes
+) {
+  let html =
+    String(
+      translated || ""
+    );
+
+  const attributeMap =
+    new Map(
+      (
+        translatedAttributes ||
+        []
+      ).map(
+        (item) => [
+          Number(
+            item.id
+          ),
+          String(
+            item.value ||
+              ""
+          ),
+        ]
+      )
+    );
+
+  function escapeAttribute(
+    value
+  ) {
+    return String(
+      value
+    )
+      .replace(
+        /&/g,
+        "&amp;"
+      )
+      .replace(
+        /"/g,
+        "&quot;"
+      )
+      .replace(
+        /</g,
+        "&lt;"
+      )
+      .replace(
+        />/g,
+        "&gt;"
+      );
+  }
+
+  for (
+    const item of
+      prepared.tags
+  ) {
+    if (
+      html.split(
+        item.token
+      ).length -
+        1 !==
+      1
+    ) {
+      throw new Error(
+        `HTML-tag ${item.token} ontbreekt of is dubbel.`
+      );
+    }
+
+    let restoredTag =
+      item.tag;
+
+    for (
+      const attr of
+        prepared.attributes
+    ) {
+      const token =
+        `___ML_ATTR_${String(
+          attr.id
+        ).padStart(
+          5,
+          "0"
+        )}___`;
+
+      if (
+        !restoredTag.includes(
+          token
+        )
+      ) {
+        continue;
+      }
+
+      let value =
+        attr.value;
+
+      if (
+        attr.translatable &&
+        attributeMap.has(
+          attr.id
+        )
+      ) {
+        value =
+          attributeMap.get(
+            attr.id
+          );
+      }
+
+      restoredTag =
+        restoredTag.replace(
+          token,
+          escapeAttribute(
+            value
+          )
+        );
+    }
+
+    html =
+      html.replace(
+        item.token,
+        restoredTag
+      );
+  }
+
+  if (
+    /___ML_ATTR_\d{5}___/.test(
+      html
+    )
+  ) {
+    throw new Error(
+      "Onopgeloste HTML-attribuut placeholder."
+    );
+  }
+
+  if (
+    /___ML_TAG_\d{5}___/.test(
+      html
+    )
+  ) {
+    throw new Error(
+      "Onopgeloste HTML-tag placeholder."
+    );
+  }
+
+  return html;
+}
+
+function htmlTags(
+  html
+) {
+  return [
+    ...String(
+      html || ""
+    ).matchAll(
+      /<\s*(\/?)\s*([a-zA-Z0-9]+)/g
+    ),
+  ].map(
+    (m) =>
+      `${m[1] ? "/" : ""}${m[2].toLowerCase()}`
+  );
+}
+
+function htmlUrls(
+  html
+) {
+  return [
+    ...String(
+      html || ""
+    ).matchAll(
+      /\b(?:href|src)\s*=\s*([\"'])([^\"']+)\1/gi
+    ),
+  ]
+    .map(
+      (m) =>
+        m[2]
+    )
+    .sort();
+}
+
+function assertHtmlSafe(
+  before,
+  after
+) {
+  const beforeTags =
+    htmlTags(
+      before
+    );
+
+  const afterTags =
+    htmlTags(
+      after
+    );
+
+  if (
+    beforeTags.length !==
+      afterTags.length ||
+    beforeTags.some(
+      (
+        value,
+        index
+      ) =>
+        value !==
+        afterTags[index]
+    )
+  ) {
+    throw new Error(
+      "HTML-tagstructuur is gewijzigd."
+    );
+  }
+
+  const beforeUrls =
+    htmlUrls(
+      before
+    );
+
+  const afterUrls =
+    htmlUrls(
+      after
+    );
+
+  if (
+    beforeUrls.length !==
+      afterUrls.length ||
+    beforeUrls.some(
+      (
+        value,
+        index
+      ) =>
+        value !==
+        afterUrls[index]
+    )
+  ) {
+    throw new Error(
+      "Een URL in de productbeschrijving is gewijzigd."
+    );
+  }
+}
+
+/* =========================================================
    OPENAI
 ========================================================= */
 
@@ -1192,11 +1434,6 @@ const PRODUCT_SCHEMA = {
     },
 
     descriptor: {
-      type:
-        "string",
-    },
-
-    productType: {
       type:
         "string",
     },
@@ -1341,7 +1578,6 @@ const PRODUCT_SCHEMA = {
   required: [
     "firstName",
     "descriptor",
-    "productType",
     "descriptionHtml",
     "seoTitle",
     "seoDescription",
@@ -1351,163 +1587,132 @@ const PRODUCT_SCHEMA = {
   ],
 };
 
-const BF_SCHEMA = {
-  type:
-    "object",
-
-  additionalProperties:
-    false,
-
-  properties: {
-    translations: {
-      type:
-        "array",
-
-      items: {
-        type:
-          "object",
-
-        additionalProperties:
-          false,
-
-        properties: {
-          id: {
-            type:
-              "integer",
-          },
-
-          text: {
-            type:
-              "string",
-          },
-        },
-
-        required: [
-          "id",
-          "text",
-        ],
-      },
-    },
-  },
-
-  required: [
-    "translations",
-  ],
-};
-
 const PRODUCT_PROMPT = `
-Je bent de vaste Franse e-commerce copywriter van Maison Lévara Paris.
+You are the permanent French e-commerce copywriter
+for Maison Lévara Paris.
 
-Vertaal de volledige aangeleverde productdata naar natuurlijk,
-professioneel Frans voor een moderne Franse modewebshop.
+Translate the supplied product into natural,
+high-quality French for a French fashion webshop.
 
-PRODUCTNAAM:
-Gebruik exact:
-"Franse voornaam | Franse productomschrijving"
+PRODUCT TITLE:
+Use exactly:
 
-De eerste helft moet een echte Franse voornaam zijn.
-De tweede helft moet een korte, duidelijke Franse omschrijving
-van het product zijn.
+"French first name | French product description"
 
-Gebruik nooit een Nederlandse, Italiaanse, Spaanse of Engelse
-voornaam.
+The first name MUST be a real French first name.
 
-De volledige titel moet uniek zijn ten opzichte van existingTitles.
+The second part must be a short, natural description
+of the product.
 
-De stijl moet aansluiten op de oude Luno Milano-naamstructuur:
-Voornaam | productomschrijving.
+This must follow the naming style used by Luno Milano:
+first name, separator " | ", then product description.
 
-BESCHRIJVING:
-Vertaal alle klantzichtbare tekst.
-Vertaal ook maattabellen, tabellen en teksten in tabellen.
+Do not use Dutch, English, Italian or Spanish words
+in the final title.
+
+The final complete title must be unique compared
+with existingTitles.
+
+DESCRIPTION:
+Translate all customer-facing text into French.
+
+Translate tables and size-table text when it is
+inside descriptionHtml.
 
 HTML:
-Behoud alle HTML-placeholders exact.
-Voeg geen HTML-tags toe.
-Verwijder geen HTML-tags.
-Verander nooit href, src of URL's.
-Verander nooit class, id of data-* attributen.
+Preserve every HTML placeholder exactly once.
 
-Vertaal normale alt/title-attributen via htmlAttributes.
+Do not add HTML tags.
+Do not remove HTML tags.
+Do not change href.
+Do not change src.
+Do not change URLs.
+Do not change class.
+Do not change id.
+Do not change data-* attributes.
 
-Behoud:
-- cijfers
-- percentages
-- maten
-- afmetingen
-- eenheden
-- SKU's
-- barcodes
-- productcodes
-- technische codes
+Translate only customer-facing text.
 
-One Size -> Taille unique.
+ALT/TITLE ATTRIBUTES:
+Translate normal customer-facing alt and title
+text supplied separately.
 
-OPTIES:
-Size / Taglia -> Taille
+Never translate href or src.
+
+OPTIONS:
+Size / Taglia / Maat -> Taille
 Color / Colore / Kleur / Colour -> Couleur
 Material -> Matière
 
-Vertaal normale kleurwaarden naar Frans.
+Translate normal textual size and color values.
 
-Laat XS, S, M, L, XL, XXL en numerieke maatcodes intact.
+Keep:
+XS
+S
+M
+L
+XL
+XXL
+numeric sizes
+measurements
+and units
 
-PRODUCTTYPE:
-Vertaal naar Frans wanneer aanwezig.
+unchanged.
+
+One Size -> Taille unique.
 
 SEO:
-Vertaal SEO title en SEO description naar natuurlijk Frans.
-Gebruik geen keyword stuffing.
+Translate SEO title and SEO description naturally.
 
-MEDIA:
-Vertaal alleen de alt-teksten.
+Do not invent facts.
+Do not use keyword stuffing.
 
-WIJZIG NOOIT:
-- prijzen
-- voorraad
-- SKU
-- barcode
-- handle
-- product-ID
-- variant-ID
-- afbeeldingen
+NEVER CHANGE:
+price
+inventory
+SKU
+barcode
+handle
+product ID
+option ID
+media ID
+URL
+numeric measurement
+technical code
 
-Gebruik geen nieuwe producteigenschappen die niet in de bron staan.
-
-Geef alleen het gevraagde JSON-object terug.
+Return JSON only.
 `;
 
 const BF_PROMPT = `
-Vertaal de tekst van een BF Size Chart naar natuurlijk Frans.
+Translate the supplied BF Size Chart customer-facing
+text into natural French.
 
-Vertaal:
-- buttonText
-- titels
-- beschrijvingen
-- kolomteksten
-- meetnamen
-- kleurwoorden
-- woorden in tabelcellen
+Translate:
+button text
+titles
+descriptions
+table headings
+measurement labels
+color wording
+size wording
+table-cell wording
 
-Taglia -> Taille
-Size -> Taille
-Colore -> Couleur
-Color -> Couleur
-Kleur -> Couleur
+Size / Taglia -> Taille
+Color / Colore / Kleur -> Couleur
 One Size -> Taille unique
 
-Behoud exact:
-- cijfers
-- maataanduidingen
-- afmetingen
-- eenheden
-- percentages
-- technische codes
-- HTML-tags en placeholders
+Keep:
+numbers
+measurements
+units
+percentages
+technical codes
+URLs
+IDs
 
-Verander nooit getallen of maten.
+unchanged.
 
-Geef alleen het gevraagde JSON-object terug.
+Return JSON only.
 `;
 
 function extractOutputText(
@@ -1557,7 +1762,7 @@ async function openAIJson(
     !OPENAI_API_KEY
   ) {
     throw new Error(
-      "OPENAI_API_KEY ontbreekt."
+      "OPENAI_API_KEY ontbreekt in Render."
     );
   }
 
@@ -1566,108 +1771,87 @@ async function openAIJson(
 
   for (
     let attempt = 0;
-    attempt < 5;
+    attempt < 4;
     attempt++
   ) {
     try {
-      const controller =
-        new AbortController();
+      const response =
+        await fetch(
+          "https://api.openai.com/v1/responses",
+          {
+            method:
+              "POST",
 
-      const timeout =
-        setTimeout(
-          () =>
-            controller.abort(),
-          180000
-        );
+            headers: {
+              "Content-Type":
+                "application/json",
 
-      let response;
+              Authorization:
+                `Bearer ${OPENAI_API_KEY}`,
+            },
 
-      try {
-        response =
-          await fetch(
-            "https://api.openai.com/v1/responses",
-            {
-              method:
-                "POST",
+            body:
+              JSON.stringify({
+                model:
+                  OPENAI_MODEL,
 
-              signal:
-                controller.signal,
+                store:
+                  false,
 
-              headers: {
-                "Content-Type":
-                  "application/json",
+                max_output_tokens:
+                  12000,
 
-                Authorization:
-                  `Bearer ${OPENAI_API_KEY}`,
-              },
+                input: [
+                  {
+                    role:
+                      "system",
 
-              body:
-                JSON.stringify({
-                  model:
-                    OPENAI_MODEL,
+                    content: [
+                      {
+                        type:
+                          "input_text",
 
-                  store:
-                    false,
-
-                  input: [
-                    {
-                      role:
-                        "system",
-
-                      content: [
-                        {
-                          type:
-                            "input_text",
-
-                          text:
-                            systemPrompt,
-                        },
-                      ],
-                    },
-
-                    {
-                      role:
-                        "user",
-
-                      content: [
-                        {
-                          type:
-                            "input_text",
-
-                          text:
-                            JSON.stringify(
-                              payload
-                            ),
-                        },
-                      ],
-                    },
-                  ],
-
-                  max_output_tokens:
-                    12000,
-
-                  text: {
-                    format: {
-                      type:
-                        "json_schema",
-
-                      name:
-                        "maison_levara_translation",
-
-                      strict:
-                        true,
-
-                      schema,
-                    },
+                        text:
+                          systemPrompt,
+                      },
+                    ],
                   },
-                }),
-            }
-          );
-      } finally {
-        clearTimeout(
-          timeout
+
+                  {
+                    role:
+                      "user",
+
+                    content: [
+                      {
+                        type:
+                          "input_text",
+
+                        text:
+                          JSON.stringify(
+                            payload
+                          ),
+                      },
+                    ],
+                  },
+                ],
+
+                text: {
+                  format: {
+                    type:
+                      "json_schema",
+
+                    name:
+                      "maison_levara_translation",
+
+                    strict:
+                      true,
+
+                    schema,
+                  },
+                },
+              }),
+          }
         );
-      }
 
       const body =
         await response.json();
@@ -1676,15 +1860,33 @@ async function openAIJson(
         response.status ===
         429
       ) {
+        const code =
+          body?.error?.code ||
+          "unknown_429";
+
+        const message =
+          body?.error?.message ||
+          "OpenAI returned HTTP 429.";
+
+        if (
+          /insufficient_quota|credit_balance_exhausted|spend_limit|billing/i.test(
+            `${code} ${message}`
+          )
+        ) {
+          throw new Error(
+            `OPENAI QUOTA/BILLING: ${code} — ${message}`
+          );
+        }
+
         lastError =
           new Error(
-            "OpenAI rate limit."
+            `OPENAI RATE LIMIT: ${code} — ${message}`
           );
 
         await sleep(
           Math.min(
             20000,
-            1500 *
+            2000 *
               2 ** attempt
           )
         );
@@ -1695,10 +1897,14 @@ async function openAIJson(
       if (
         !response.ok
       ) {
-        throw new Error(
-          `OpenAI HTTP ${response.status}: ${JSON.stringify(
+        const message =
+          body?.error?.message ||
+          JSON.stringify(
             body
-          )}`
+          );
+
+        throw new Error(
+          `OpenAI HTTP ${response.status}: ${message}`
         );
       }
 
@@ -1725,14 +1931,22 @@ async function openAIJson(
         error;
 
       if (
-        attempt === 4
+        /OPENAI QUOTA\/BILLING/i.test(
+          error.message
+        )
+      ) {
+        throw error;
+      }
+
+      if (
+        attempt === 3
       ) {
         break;
       }
 
       await sleep(
         Math.min(
-          20000,
+          15000,
           1500 *
             2 ** attempt
         )
@@ -1752,7 +1966,7 @@ async function openAIJson(
    PRODUCT TRANSLATION
 ========================================================= */
 
-function buildProductPayload(
+function productPayload(
   product,
   reservedTitles
 ) {
@@ -1766,12 +1980,14 @@ function buildProductPayload(
     currentTitle:
       product.title,
 
-    currentProductType:
-      product.productType ||
-      "",
-
     descriptionHtml:
       prepared.html,
+
+    htmlPlaceholders:
+      prepared.tags.map(
+        (x) =>
+          x.token
+      ),
 
     htmlAttributes:
       prepared.attributes,
@@ -1827,123 +2043,48 @@ function buildProductPayload(
 
     existingTitles:
       [
-        ...reservedTitles,
+        ...reservedTitles
       ],
   };
 }
 
-function uniqueFallbackTitle(
-  descriptor,
-  reservedTitles,
-  start
+function validUniqueTitle(
+  title,
+  reservedTitles
 ) {
-  for (
-    let offset = 0;
-    offset <
-      FRENCH_NAMES.length;
-    offset++
+  const parts =
+    String(
+      title ||
+        ""
+    ).split("|");
+
+  if (
+    parts.length !==
+    2
   ) {
-    const name =
-      FRENCH_NAMES[
-        (
-          start +
-          offset
-        ) %
-          FRENCH_NAMES.length
-      ];
+    return false;
+  }
 
-    const title =
-      `${name} | ${descriptor}`;
+  const firstName =
+    normalize(
+      parts[0]
+    );
 
-    if (
-      !reservedTitles.has(
-        normalize(title)
+  const descriptor =
+    parts[1].trim();
+
+  return (
+    FRENCH_NAME_KEYS.has(
+      firstName
+    ) &&
+    descriptor.length >
+      1 &&
+    !reservedTitles.has(
+      normalize(
+        title
       )
-    ) {
-      return title;
-    }
-  }
-
-  throw new Error(
-    "Geen unieke Franse productnaam gevonden."
+    )
   );
-}
-
-function optionValuesUnique(
-  product,
-  result
-) {
-  for (
-    const option of
-      product.options
-  ) {
-    const translated =
-      result.options.find(
-        (item) =>
-          Number(
-            item.index
-          ) ===
-          Number(
-            option.position -
-              1
-          )
-      );
-
-    if (
-      !translated
-    ) {
-      continue;
-    }
-
-    const seen =
-      new Set();
-
-    for (
-      const original of
-        option.optionValues
-    ) {
-      const match =
-        (
-          translated.values ||
-          []
-        ).find(
-          (value) =>
-            String(
-              value.id
-            ) ===
-            String(
-              original.id
-            )
-        );
-
-      const finalValue =
-        String(
-          match?.name ??
-            original.name
-        ).trim();
-
-      const key =
-        normalize(
-          finalValue
-        );
-
-      if (
-        !key
-      ) {
-        continue;
-      }
-
-      if (
-        seen.has(key)
-      ) {
-        return false;
-      }
-
-      seen.add(key);
-    }
-  }
-
-  return true;
 }
 
 async function translateProduct(
@@ -1958,7 +2099,7 @@ async function translateProduct(
     );
 
   const payload =
-    buildProductPayload(
+    productPayload(
       product,
       reservedTitles
     );
@@ -1968,10 +2109,12 @@ async function translateProduct(
     attempt < 6;
     attempt++
   ) {
-    payload.retryInstruction =
-      attempt
-        ? `La précédente proposition de titre "${payload.previousTitle}" ou les valeurs d'options n'étaient pas valides. Choisis une autre combinaison et garde toutes les valeurs d'une même option uniques.`
-        : "";
+    if (
+      attempt > 0
+    ) {
+      payload.retry =
+        `The previous title "${payload.previousTitle}" was rejected. Choose a different complete French title.`;
+    }
 
     const result =
       await openAIJson(
@@ -1995,10 +2138,7 @@ async function translateProduct(
     ) {
       firstName =
         FRENCH_NAMES[
-          (
-            index +
-            attempt
-          ) %
+          index %
             FRENCH_NAMES.length
         ];
     }
@@ -2014,32 +2154,16 @@ async function translateProduct(
         )
         .trim();
 
-    if (
-      !descriptor
-    ) {
-      continue;
-    }
-
-    let title =
+    const title =
       `${firstName} | ${descriptor}`.trim();
 
     payload.previousTitle =
       title;
 
     if (
-      reservedTitles.has(
-        normalize(
-          title
-        )
-      )
-    ) {
-      continue;
-    }
-
-    if (
-      !optionValuesUnique(
-        product,
-        result
+      !validUniqueTitle(
+        title,
+        reservedTitles
       )
     ) {
       continue;
@@ -2058,21 +2182,6 @@ async function translateProduct(
       descriptionHtml
     );
 
-    if (
-      reservedTitles.has(
-        normalize(
-          title
-        )
-      )
-    ) {
-      title =
-        uniqueFallbackTitle(
-          descriptor,
-          reservedTitles,
-          index
-        );
-    }
-
     reservedTitles.add(
       normalize(
         title
@@ -2081,14 +2190,6 @@ async function translateProduct(
 
     return {
       title,
-
-      productType:
-        product.productType
-          ? String(
-              result.productType ||
-                product.productType
-            ).trim()
-          : "",
 
       descriptionHtml,
 
@@ -2121,12 +2222,12 @@ async function translateProduct(
   }
 
   throw new Error(
-    `Geen geldige unieke Franse vertaling voor "${product.title}".`
+    `Geen unieke Franse productnaam gevonden voor: ${product.title}`
   );
 }
 
 /* =========================================================
-   PRODUCT WRITE
+   PRODUCT UPDATE
 ========================================================= */
 
 async function updateProduct(
@@ -2139,9 +2240,11 @@ async function updateProduct(
     mutation UpdateProduct(
       $product: ProductUpdateInput!
     ) {
+
       productUpdate(
         product: $product
       ) {
+
         userErrors {
           field
           message
@@ -2151,39 +2254,11 @@ async function updateProduct(
         product {
           id
           title
-          productType
           handle
         }
       }
     }
   `;
-
-  const input = {
-    id:
-      product.id,
-
-    title:
-      translated.title,
-
-    descriptionHtml:
-      translated.descriptionHtml,
-
-    seo: {
-      title:
-        translated.seoTitle,
-
-      description:
-        translated.seoDescription,
-    },
-  };
-
-  if (
-    product.productType
-  ) {
-    input.productType =
-      translated.productType ||
-      product.productType;
-  }
 
   const data =
     await shopifyGraphQL(
@@ -2191,8 +2266,24 @@ async function updateProduct(
       token,
       mutation,
       {
-        product:
-          input,
+        product: {
+          id:
+            product.id,
+
+          title:
+            translated.title,
+
+          descriptionHtml:
+            translated.descriptionHtml,
+
+          seo: {
+            title:
+              translated.seoTitle,
+
+            description:
+              translated.seoDescription,
+          },
+        },
       }
     );
 
@@ -2206,8 +2297,8 @@ async function updateProduct(
     throw new Error(
       errors
         .map(
-          (error) =>
-            error.message
+          (e) =>
+            e.message
         )
         .join(" | ")
     );
@@ -2215,7 +2306,7 @@ async function updateProduct(
 }
 
 /* =========================================================
-   OPTION WRITE
+   PRODUCT OPTIONS
 ========================================================= */
 
 async function updateOptions(
@@ -2228,14 +2319,14 @@ async function updateOptions(
     const option of
       product.options
   ) {
+    /*
+      Linked options are controlled by their
+      linked metafield and should not be changed
+      directly here.
+    */
     if (
       option.linkedMetafield
     ) {
-      /*
-        A linked option is controlled through
-        its linked metafield. Do not mutate the
-        source value and risk breaking that link.
-      */
       continue;
     }
 
@@ -2283,15 +2374,15 @@ async function updateOptions(
               return null;
             }
 
-            const value =
+            const name =
               String(
                 match.name ||
                   ""
               ).trim();
 
             if (
-              !value ||
-              value ===
+              !name ||
+              name ===
                 original.name.trim()
             ) {
               return null;
@@ -2301,8 +2392,7 @@ async function updateOptions(
               id:
                 original.id,
 
-              name:
-                value,
+              name,
             };
           }
         )
@@ -2323,7 +2413,8 @@ async function updateOptions(
 
     if (
       !nameChanged &&
-      !updates.length
+      updates.length ===
+        0
     ) {
       continue;
     }
@@ -2334,11 +2425,13 @@ async function updateOptions(
         $option: OptionUpdateInput!,
         $optionValuesToUpdate: [OptionValueUpdateInput!]
       ) {
+
         productOptionUpdate(
           productId: $productId,
           option: $option,
           optionValuesToUpdate: $optionValuesToUpdate
         ) {
+
           userErrors {
             field
             message
@@ -2365,12 +2458,12 @@ async function updateOptions(
             id:
               option.id,
 
+            position:
+              option.position,
+
             name:
               optionName ||
               option.name,
-
-            position:
-              option.position,
           },
 
           optionValuesToUpdate:
@@ -2388,8 +2481,8 @@ async function updateOptions(
       throw new Error(
         errors
           .map(
-            (error) =>
-              error.message
+            (e) =>
+              e.message
           )
           .join(" | ")
       );
@@ -2398,7 +2491,7 @@ async function updateOptions(
 }
 
 /* =========================================================
-   MEDIA ALT TEXT
+   MEDIA ALT
 ========================================================= */
 
 async function updateMediaAlt(
@@ -2407,21 +2500,26 @@ async function updateMediaAlt(
   product,
   translated
 ) {
-  const files =
+  const media =
     translated.media
       .map(
         (item) => {
           const original =
             product.media.nodes.find(
-              (media) =>
-                media.id ===
+              (m) =>
+                m.id ===
                 item.id
             );
 
           if (
-            !original ||
+            !original
+          ) {
+            return null;
+          }
+
+          if (
             typeof item.alt !==
-              "string"
+            "string"
           ) {
             return null;
           }
@@ -2431,9 +2529,7 @@ async function updateMediaAlt(
               original.alt ||
                 ""
             ) ===
-            String(
-              item.alt
-            )
+            item.alt
           ) {
             return null;
           }
@@ -2452,22 +2548,84 @@ async function updateMediaAlt(
       );
 
   if (
-    !files.length
+    !media.length
   ) {
     return;
   }
 
   const mutation = `
-    mutation UpdateFiles(
-      $files: [FileUpdateInput!]!
+    mutation UpdateMedia(
+      $productId: ID!,
+      $media: [UpdateMediaInput!]!
     ) {
-      fileUpdate(
-        files: $files
+
+      productUpdateMedia(
+        productId: $productId,
+        media: $media
       ) {
-        files {
+
+        media {
           id
           alt
         }
+
+        mediaUserErrors {
+          field
+          message
+          code
+        }
+      }
+    }
+  `;
+
+  const data =
+    await shopifyGraphQL(
+      shop,
+      token,
+      mutation,
+      {
+        productId:
+          product.id,
+
+        media,
+      }
+    );
+
+  const errors =
+    data.productUpdateMedia
+      .mediaUserErrors || [];
+
+  if (
+    errors.length
+  ) {
+    throw new Error(
+      errors
+        .map(
+          (e) =>
+            e.message
+        )
+        .join(" | ")
+    );
+  }
+}
+
+/* =========================================================
+   MARK PRODUCT DONE
+========================================================= */
+
+async function markDone(
+  shop,
+  token,
+  productId
+) {
+  const mutation = `
+    mutation MarkDone(
+      $metafields: [MetafieldsSetInput!]!
+    ) {
+
+      metafieldsSet(
+        metafields: $metafields
+      ) {
 
         userErrors {
           field
@@ -2484,12 +2642,29 @@ async function updateMediaAlt(
       token,
       mutation,
       {
-        files,
+        metafields: [
+          {
+            ownerId:
+              productId,
+
+            namespace:
+              "maison_levara",
+
+            key:
+              "fr_translation_v1",
+
+            type:
+              "single_line_text_field",
+
+            value:
+              "done",
+          },
+        ],
       }
     );
 
   const errors =
-    data.fileUpdate
+    data.metafieldsSet
       .userErrors || [];
 
   if (
@@ -2498,16 +2673,30 @@ async function updateMediaAlt(
     throw new Error(
       errors
         .map(
-          (error) =>
-            error.message
+          (e) =>
+            e.message
         )
         .join(" | ")
     );
   }
 }
 
+function isDone(
+  product
+) {
+  return product.metafields.nodes.some(
+    (field) =>
+      field.namespace ===
+        "maison_levara" &&
+      field.key ===
+        "fr_translation_v1" &&
+      field.value ===
+        "done"
+  );
+}
+
 /* =========================================================
-   ONE PRODUCT
+   PROCESS ONE PRODUCT
 ========================================================= */
 
 async function processProduct(
@@ -2555,288 +2744,10 @@ async function processProduct(
 }
 
 /* =========================================================
-   BF SIZE CHARTS
+   BF TRANSLATION
 ========================================================= */
 
-const BF_QUERY = `
-  query BFSizeCharts {
-    shop {
-      id
-
-      metafield(
-        namespace: "sizechartsrelentless"
-        key: "size_charts"
-      ) {
-        id
-        namespace
-        key
-        type
-        value
-        compareDigest
-      }
-    }
-  }
-`;
-
-async function getBFSizeCharts(
-  shop,
-  token
-) {
-  const data =
-    await shopifyGraphQL(
-      shop,
-      token,
-      BF_QUERY
-    );
-
-  return {
-    shopId:
-      data.shop.id,
-
-    metafield:
-      data.shop.metafield,
-  };
-}
-
-function isNumericLike(
-  value
-) {
-  const text =
-    String(
-      value || ""
-    ).trim();
-
-  if (
-    !text
-  ) {
-    return true;
-  }
-
-  return (
-    /^[-+]?\d+(?:[.,]\d+)?$/.test(
-      text
-    ) ||
-    /^[-+]?\d+(?:[.,]\d+)?\s*(?:cm|mm|m|kg|g|lb|lbs|in|inch|inches|%|°c|°f)$/i.test(
-      text
-    ) ||
-    /^\d+\s*[-–]\s*\d+$/.test(
-      text
-    ) ||
-    /^\d+(?:[.,]\d+)?\s*[x×]\s*\d+(?:[.,]\d+)?$/i.test(
-      text
-    )
-  );
-}
-
-function collectBFStrings(
-  node,
-  result = [],
-  currentPath = []
-) {
-  if (
-    Array.isArray(node)
-  ) {
-    node.forEach(
-      (
-        item,
-        index
-      ) =>
-        collectBFStrings(
-          item,
-          result,
-          currentPath.concat(
-            String(index)
-          )
-        )
-    );
-
-    return result;
-  }
-
-  if (
-    !node ||
-    typeof node !==
-      "object"
-  ) {
-    return result;
-  }
-
-  for (
-    const [
-      key,
-      value
-    ] of Object.entries(
-      node
-    )
-  ) {
-    const nextPath =
-      currentPath.concat(
-        key
-      );
-
-    const productConditionTitle =
-      key ===
-        "title" &&
-      node.type ===
-        "product" &&
-      node.id != null;
-
-    if (
-      typeof value ===
-        "string" &&
-      [
-        "buttonText",
-        "title",
-        "descriptionTop",
-        "descriptionBottom",
-      ].includes(
-        key
-      )
-    ) {
-      if (
-        !productConditionTitle &&
-        value.trim() &&
-        !isNumericLike(
-          value
-        )
-      ) {
-        result.push({
-          path:
-            nextPath,
-
-          text:
-            value,
-        });
-      }
-
-      continue;
-    }
-
-    if (
-      key.toLowerCase() ===
-        "values"
-    ) {
-      collectBFValues(
-        value,
-        result,
-        nextPath
-      );
-
-      continue;
-    }
-
-    collectBFStrings(
-      value,
-      result,
-      nextPath
-    );
-  }
-
-  return result;
-}
-
-function collectBFValues(
-  node,
-  result,
-  currentPath
-) {
-  if (
-    Array.isArray(node)
-  ) {
-    node.forEach(
-      (
-        item,
-        index
-      ) =>
-        collectBFValues(
-          item,
-          result,
-          currentPath.concat(
-            String(index)
-          )
-        )
-    );
-
-    return;
-  }
-
-  if (
-    typeof node ===
-      "string"
-  ) {
-    if (
-      node.trim() &&
-      !isNumericLike(
-        node
-      )
-    ) {
-      result.push({
-        path:
-          currentPath,
-
-        text:
-          node,
-      });
-    }
-
-    return;
-  }
-
-  if (
-    node &&
-    typeof node ===
-      "object"
-  ) {
-    for (
-      const [
-        key,
-        value
-      ] of Object.entries(
-        node
-      )
-    ) {
-      collectBFValues(
-        value,
-        result,
-        currentPath.concat(
-          key
-        )
-      );
-    }
-  }
-}
-
-function setDeepValue(
-  root,
-  pathParts,
-  value
-) {
-  let current =
-    root;
-
-  for (
-    let i = 0;
-    i <
-      pathParts.length -
-        1;
-    i++
-  ) {
-    current =
-      current[
-        pathParts[i]
-      ];
-  }
-
-  current[
-    pathParts[
-      pathParts.length -
-        1
-    ]
-  ] =
-    value;
-}
-
-async function translateBFStrings(
+async function translateBFEntries(
   entries
 ) {
   const results =
@@ -2845,7 +2756,51 @@ async function translateBFStrings(
     );
 
   const chunkSize =
-    60;
+    30;
+
+  const schema = {
+    type:
+      "object",
+
+    additionalProperties:
+      false,
+
+    properties: {
+      translations: {
+        type:
+          "array",
+
+        items: {
+          type:
+            "object",
+
+          additionalProperties:
+            false,
+
+          properties: {
+            id: {
+              type:
+                "integer",
+            },
+
+            text: {
+              type:
+                "string",
+            },
+          },
+
+          required: [
+            "id",
+            "text",
+          ],
+        },
+      },
+    },
+
+    required: [
+      "translations",
+    ],
+  };
 
   for (
     let start = 0;
@@ -2867,72 +2822,20 @@ async function translateBFStrings(
           (
             item,
             index
-          ) => {
-            const prepared =
-              protectHtml(
-                item.text
-              );
+          ) => ({
+            id:
+              index,
 
-            return {
-              id:
-                index,
-
-              text:
-                prepared.html,
-
-              attributes:
-                prepared.attributes,
-            };
-          }
+            text:
+              item.text,
+          })
         ),
     };
 
     const response =
       await openAIJson(
         BF_PROMPT,
-        {
-          type:
-            "object",
-
-          additionalProperties:
-            false,
-
-          properties: {
-            translations: {
-              type:
-                "array",
-
-              items: {
-                type:
-                  "object",
-
-                additionalProperties:
-                  false,
-
-                properties: {
-                  id: {
-                    type:
-                      "integer",
-                  },
-
-                  text: {
-                    type:
-                      "string",
-                  },
-                },
-
-                required: [
-                  "id",
-                  "text",
-                ],
-              },
-            },
-          },
-
-          required: [
-            "translations",
-          ],
-        },
+        schema,
         payload
       );
 
@@ -2941,173 +2844,40 @@ async function translateBFStrings(
         response.translations ||
         []
     ) {
-      const index =
+      const localIndex =
         Number(
           item.id
         );
 
       if (
-        !Number.isInteger(
-          index
-        ) ||
-        index < 0 ||
-        index >=
+        Number.isInteger(
+          localIndex
+        ) &&
+        localIndex >=
+          0 &&
+        localIndex <
           chunk.length
       ) {
-        continue;
-      }
-
-      /*
-        BF strings may themselves contain HTML.
-        Preserve that HTML exactly.
-      */
-      const prepared =
-        protectHtml(
-          chunk[index].text
-        );
-
-      let restored =
-        String(
-          item.text ||
-            ""
-        );
-
-      try {
-        /*
-          When the BF string contains
-          HTML, OpenAI sees placeholders.
-          Reuse restoreHtml for safety.
-        */
-        const attrs =
-          Array.isArray(
-            item.attributes
-          )
-            ? item.attributes
-            : [];
-
-        restored =
-          restoreHtml(
-            restored,
-            prepared,
-            attrs
+        results[
+          start +
+            localIndex
+        ] =
+          String(
+            item.text ||
+              ""
           );
-      } catch {
-        /*
-          For plain text without HTML,
-          restoreHtml still works only
-          when there are zero tags.
-        */
-        if (
-          prepared.tags.length ===
-          0
-        ) {
-          restored =
-            String(
-              item.text ||
-                ""
-            );
-        } else {
-          throw new Error(
-            `BF HTML-vertaling ongeldig voor "${chunk[index].text}".`
-          );
-        }
       }
-
-      assertHtmlSafe(
-        chunk[index].text,
-        restored
-      );
-
-      results[
-        start +
-          index
-      ] =
-        restored;
     }
   }
 
   return results;
 }
 
-function syncBFProductTitles(
-  root,
-  renamedByLegacyId,
-  renamedByGid
-) {
-  if (
-    Array.isArray(root)
-  ) {
-    root.forEach(
-      (item) =>
-        syncBFProductTitles(
-          item,
-          renamedByLegacyId,
-          renamedByGid
-        )
-    );
-
-    return;
-  }
-
-  if (
-    !root ||
-    typeof root !==
-      "object"
-  ) {
-    return;
-  }
-
-  if (
-    root.type ===
-      "product" &&
-    typeof root.title ===
-      "string"
-  ) {
-    const id =
-      root.id != null
-        ? String(
-            root.id
-          )
-        : "";
-
-    if (
-      renamedByLegacyId.has(
-        id
-      )
-    ) {
-      root.title =
-        renamedByLegacyId.get(
-          id
-        );
-    } else if (
-      renamedByGid.has(
-        id
-      )
-    ) {
-      root.title =
-        renamedByGid.get(
-          id
-        );
-    }
-  }
-
-  Object.values(
-    root
-  ).forEach(
-    (value) =>
-      syncBFProductTitles(
-        value,
-        renamedByLegacyId,
-        renamedByGid
-      )
-  );
-}
-
-async function updateBFSizeCharts(
+async function updateBFSizeChart(
   shop,
   token,
   products,
-  renamedProducts
+  originalTitleToNewTitle
 ) {
   const bf =
     await getBFSizeCharts(
@@ -3119,7 +2889,7 @@ async function updateBFSizeCharts(
     !bf.metafield
   ) {
     log(
-      "BF size_charts niet gevonden; geen BF-write uitgevoerd."
+      "BF Size Chart niet gevonden."
     );
 
     return;
@@ -3134,7 +2904,7 @@ async function updateBFSizeCharts(
       );
   } catch {
     throw new Error(
-      "BF size_charts bevat ongeldige JSON."
+      "BF Size Chart bevat geen geldige JSON."
     );
   }
 
@@ -3145,29 +2915,51 @@ async function updateBFSizeCharts(
       )
     );
 
-  const entries =
-    collectBFStrings(
-      updated
-    ).map(
-      (entry) => ({
-        ...entry,
+  /*
+    Replace old product titles with their
+    final French titles before AI translation.
+  */
+  const titleMap =
+    new Map(
+      originalTitleToNewTitle
+    );
 
-        prepared:
-          protectHtml(
-            entry.text
-          ),
-      })
+  replaceKnownProductTitles(
+    updated,
+    titleMap
+  );
+
+  /*
+    Never send final product titles through the
+    generic BF translator again.
+  */
+  const protectedTitles =
+    new Set([
+      ...titleMap.keys(),
+      ...[
+        ...titleMap.values()
+      ].map(
+        normalize
+      ),
+    ]);
+
+  const entries =
+    collectBFTextEntries(
+      updated,
+      [],
+      [],
+      protectedTitles
     );
 
   if (
     entries.length
   ) {
     log(
-      `BF: ${entries.length} tekstvelden gevonden.`
+      `BF: ${entries.length} tekstvelden worden vertaald.`
     );
 
     const translated =
-      await translateBFStrings(
+      await translateBFEntries(
         entries
       );
 
@@ -3179,14 +2971,14 @@ async function updateBFSizeCharts(
     ) {
       if (
         typeof translated[i] !==
-          "string"
+        "string"
       ) {
         throw new Error(
-          `BF vertaling ontbreekt voor "${entries[i].text}".`
+          `BF-vertaling ontbreekt voor "${entries[i].text}".`
         );
       }
 
-      setDeepValue(
+      setDeep(
         updated,
         entries[i].path,
         translated[i]
@@ -3194,68 +2986,25 @@ async function updateBFSizeCharts(
     }
   }
 
-  const renamedByLegacyId =
-    new Map();
-
-  const renamedByGid =
-    new Map();
-
-  for (
-    const product of
-      products
-  ) {
-    renamedByLegacyId.set(
-      String(
-        product.legacyResourceId
-      ),
-      product.title
-    );
-
-    renamedByGid.set(
-      String(
-        product.id
-      ),
-      product.title
-    );
-  }
-
-  for (
-    const [
-      id,
-      title
-    ] of
-      renamedProducts
-  ) {
-    if (
-      id.startsWith(
-        "gid://"
-      )
-    ) {
-      renamedByGid.set(
-        id,
-        title
-      );
-    } else {
-      renamedByLegacyId.set(
-        id,
-        title
-      );
-    }
-  }
-
-  syncBFProductTitles(
+  /*
+    Product titles may be represented in BF by
+    their original title. Replace them again after
+    translation as an extra safety pass.
+  */
+  replaceKnownProductTitles(
     updated,
-    renamedByLegacyId,
-    renamedByGid
+    titleMap
   );
 
   const mutation = `
     mutation UpdateBF(
       $metafields: [MetafieldsSetInput!]!
     ) {
+
       metafieldsSet(
         metafields: $metafields
       ) {
+
         metafields {
           id
           namespace
@@ -3292,7 +3041,7 @@ async function updateBFSizeCharts(
               "size_charts",
 
             type:
-              "json",
+              bf.metafield.type,
 
             value:
               JSON.stringify(
@@ -3316,12 +3065,12 @@ async function updateBFSizeCharts(
     errors.length
   ) {
     throw new Error(
-      errors
+      `BF Size Chart opslaan mislukt: ${errors
         .map(
-          (error) =>
-            error.message
+          (e) =>
+            e.message
         )
-        .join(" | ")
+        .join(" | ")}`
     );
   }
 
@@ -3331,7 +3080,7 @@ async function updateBFSizeCharts(
 }
 
 /* =========================================================
-   FULL JOB
+   FULL TRANSLATION JOB
 ========================================================= */
 
 async function runFullJob(
@@ -3391,7 +3140,7 @@ async function runFullJob(
 
   try {
     log(
-      "Shopify-productcatalogus ophalen..."
+      "Productcatalogus ophalen..."
     );
 
     const products =
@@ -3418,6 +3167,19 @@ async function runFullJob(
       products.length -
       pending.length;
 
+    log(
+      `${products.length} producten gevonden.`
+    );
+
+    log(
+      `${pending.length} producten worden verwerkt.`
+    );
+
+    /*
+      All current titles are reserved.
+      A generated French title cannot duplicate
+      any title already in the catalog.
+    */
     const reservedTitles =
       new Set(
         products.map(
@@ -3429,56 +3191,19 @@ async function runFullJob(
       );
 
     /*
-      old/new title map for BF.
+      Old title -> final French title.
+      Used to update BF Size Chart product
+      conditions after product processing.
     */
-    const renamedProducts =
+    const originalTitleToNewTitle =
       new Map();
-
-    /*
-      IMPORTANT:
-      Existing completed products already have
-      their final title. Store those too so BF
-      stays synchronized.
-    */
-    for (
-      const product of
-        products
-    ) {
-      if (
-        isDone(
-          product
-        )
-      ) {
-        renamedProducts.set(
-          String(
-            product.legacyResourceId
-          ),
-          product.title
-        );
-
-        renamedProducts.set(
-          String(
-            product.id
-          ),
-          product.title
-        );
-      }
-    }
-
-    log(
-      `${products.length} producten gevonden.`
-    );
-
-    log(
-      `${pending.length} producten worden verwerkt.`
-    );
 
     let cursor =
       0;
 
     const workerCount =
       Math.min(
-        3,
+        TRANSLATION_CONCURRENCY,
         Math.max(
           1,
           pending.length
@@ -3528,16 +3253,9 @@ async function runFullJob(
               index
             );
 
-          renamedProducts.set(
-            String(
-              product.legacyResourceId
-            ),
-            translated.title
-          );
-
-          renamedProducts.set(
-            String(
-              product.id
+          originalTitleToNewTitle.set(
+            normalize(
+              product.title
             ),
             translated.title
           );
@@ -3593,7 +3311,8 @@ async function runFullJob(
     );
 
     /*
-      Read again after product writes.
+      Get the post-translation catalog so we know
+      the final state before touching BF.
     */
     const updatedProducts =
       await getAllProducts(
@@ -3601,16 +3320,33 @@ async function runFullJob(
         connection.accessToken
       );
 
-    log(
-      "BF Size Chart verwerken..."
-    );
+    if (
+      originalTitleToNewTitle.size
+    ) {
+      try {
+        await updateBFSizeChart(
+          shop,
+          connection.accessToken,
+          updatedProducts,
+          originalTitleToNewTitle
+        );
+      } catch (
+        error
+      ) {
+        job.failed++;
 
-    await updateBFSizeCharts(
-      shop,
-      connection.accessToken,
-      updatedProducts,
-      renamedProducts
-    );
+        const message =
+          `BF Size Charts: ${error.message}`;
+
+        job.errors.push(
+          message
+        );
+
+        log(
+          `BF FOUT: ${message}`
+        );
+      }
+    }
 
     log(
       `JOB KLAAR — verwerkt: ${job.processed}, overgeslagen: ${job.skipped}, fouten: ${job.failed}.`
@@ -3640,7 +3376,7 @@ async function runFullJob(
 }
 
 /* =========================================================
-   ONE-PRODUCT TEST
+   TEST ONE PRODUCT
 ========================================================= */
 
 async function runTestOne(
@@ -3677,7 +3413,7 @@ async function runTestOne(
     !product
   ) {
     throw new Error(
-      "Geen onvertaald product gevonden."
+      "Alle producten zijn al gemarkeerd als verwerkt."
     );
   }
 
@@ -3691,17 +3427,26 @@ async function runTestOne(
       )
     );
 
-  return processProduct(
-    shop,
-    connection.accessToken,
-    product,
-    reservedTitles,
-    0
-  );
+  const translated =
+    await processProduct(
+      shop,
+      connection.accessToken,
+      product,
+      reservedTitles,
+      0
+    );
+
+  return {
+    originalTitle:
+      product.title,
+
+    newTitle:
+      translated.title,
+  };
 }
 
 /* =========================================================
-   HOME
+   ROUTES
 ========================================================= */
 
 app.get(
@@ -3713,15 +3458,11 @@ app.get(
     res.send(
       `
       <h1>Maison Lévara Paris</h1>
-      <p>Shopify API is online.</p>
+      <p>Shopify translation API is online.</p>
       `
     );
   }
 );
-
-/* =========================================================
-   HEALTH
-========================================================= */
 
 app.get(
   "/health",
@@ -3751,14 +3492,14 @@ app.get(
       shopifyApiVersion:
         SHOPIFY_API_VERSION,
 
-      scopes:
-        SHOPIFY_SCOPES,
+      translationConcurrency:
+        TRANSLATION_CONCURRENCY,
     });
   }
 );
 
 /* =========================================================
-   AUTH START
+   AUTH
 ========================================================= */
 
 app.get(
@@ -3771,9 +3512,7 @@ app.get(
       req.query.shop;
 
     if (
-      !validShop(
-        shop
-      )
+      !validShop(shop)
     ) {
       return res
         .status(400)
@@ -3837,10 +3576,6 @@ app.get(
   }
 );
 
-/* =========================================================
-   AUTH CALLBACK
-========================================================= */
-
 app.get(
   "/auth/callback",
   async (
@@ -3854,9 +3589,7 @@ app.get(
     } = req.query;
 
     if (
-      !validShop(
-        shop
-      )
+      !validShop(shop)
     ) {
       return res
         .status(400)
@@ -3889,7 +3622,7 @@ app.get(
     }
 
     if (
-      !verifyHmac(
+      !verifyShopifyHmac(
         req.query
       )
     ) {
@@ -3996,7 +3729,7 @@ app.get(
 );
 
 /* =========================================================
-   PRODUCTS READ CHECK
+   PRODUCTS READ
 ========================================================= */
 
 app.get(
@@ -4009,14 +3742,12 @@ app.get(
       req.query.shop;
 
     if (
-      !validShop(
-        shop
-      )
+      !validShop(shop)
     ) {
       return res
         .status(400)
         .send(
-          "Ongeldige Shopify shop."
+          "Ongeldige shop."
         );
     }
 
@@ -4063,18 +3794,19 @@ app.get(
                 handle:
                   product.handle,
 
-                productType:
-                  product.productType,
-
                 options:
                   product.options.map(
-                    (option) => ({
+                    (
+                      option
+                    ) => ({
                       name:
                         option.name,
 
                       values:
                         option.optionValues.map(
-                          (value) =>
+                          (
+                            value
+                          ) =>
                             value.name
                         ),
                     })
@@ -4107,7 +3839,7 @@ app.get(
 );
 
 /* =========================================================
-   BF DIAGNOSE
+   BF READ-ONLY DIAGNOSE
 ========================================================= */
 
 app.get(
@@ -4120,15 +3852,13 @@ app.get(
       req.query.shop;
 
     if (
-      !validShop(
-        shop
-      )
+      !validShop(shop)
     ) {
       return res
         .status(400)
         .json({
           error:
-            "Ongeldige Shopify shop.",
+            "Ongeldige shop."
         });
     }
 
@@ -4144,7 +3874,7 @@ app.get(
         .status(401)
         .json({
           error:
-            "Shopify is niet verbonden.",
+            "Shopify is niet verbonden."
         });
     }
 
@@ -4165,7 +3895,7 @@ app.get(
               false,
 
             message:
-              "sizechartsrelentless.size_charts niet gevonden.",
+              "sizechartsrelentless.size_charts niet gevonden."
           });
       }
 
@@ -4204,11 +3934,6 @@ app.get(
 
         json:
           parsed,
-
-        value:
-          parsed === null
-            ? bf.metafield.value
-            : undefined,
       });
     } catch (
       error
@@ -4237,21 +3962,17 @@ app.get(
       req.query.shop;
 
     if (
-      !validShop(
-        shop
-      )
+      !validShop(shop)
     ) {
       return res
         .status(400)
         .send(
-          "Ongeldige Shopify shop."
+          "Ongeldige shop."
         );
     }
 
     if (
-      getSessionShop(
-        req
-      ) !==
+      getSessionShop(req) !==
       shop
     ) {
       return res
@@ -4277,49 +3998,98 @@ app.get(
 >
 
 <title>
-Maison Lévara — Franse vertaling
+  Maison Lévara — Franse vertaling
 </title>
 
 <style>
 
 body{
-  font-family:Arial,sans-serif;
-  max-width:1000px;
-  margin:40px auto;
-  padding:0 20px;
+  font-family:
+    Arial,
+    sans-serif;
+
+  max-width:
+    1000px;
+
+  margin:
+    40px auto;
+
+  padding:
+    0 20px;
+
+  color:
+    #111;
 }
 
 .card{
-  background:#f4f4f4;
-  padding:20px;
-  border-radius:10px;
-  margin:18px 0;
+  background:
+    #f4f4f4;
+
+  padding:
+    20px;
+
+  border-radius:
+    10px;
+
+  margin:
+    18px 0;
 }
 
 button{
-  background:#111;
-  color:#fff;
-  border:0;
-  border-radius:7px;
-  padding:14px 20px;
-  margin:5px 8px 5px 0;
-  cursor:pointer;
-  font-size:15px;
+  background:
+    #111;
+
+  color:
+    #fff;
+
+  border:
+    0;
+
+  border-radius:
+    7px;
+
+  padding:
+    14px 20px;
+
+  margin:
+    5px 8px 5px 0;
+
+  cursor:
+    pointer;
+
+  font-size:
+    15px;
 }
 
 button:disabled{
-  opacity:.45;
-  cursor:not-allowed;
+  opacity:
+    .45;
+
+  cursor:
+    not-allowed;
 }
 
 pre{
-  background:#111;
-  color:#eee;
-  padding:16px;
-  border-radius:8px;
-  white-space:pre-wrap;
-  max-height:520px;
-  overflow:auto;
+  background:
+    #111;
+
+  color:
+    #eee;
+
+  padding:
+    16px;
+
+  border-radius:
+    8px;
+
+  white-space:
+    pre-wrap;
+
+  max-height:
+    520px;
+
+  overflow:
+    auto;
 }
 
 </style>
@@ -4329,44 +4099,47 @@ pre{
 <body>
 
 <h1>
-Maison Lévara Paris
+  Maison Lévara Paris
 </h1>
 
 <h2>
-Franse productvertaling
+  Franse productvertaling
 </h2>
 
 <div class="card">
 
 <p>
-<strong>Shop:</strong>
-${shop}
+  <strong>Shop:</strong>
+  ${shop}
 </p>
 
 <p>
-De automatisering vertaalt producttitel,
-producttype, volledige beschrijving, SEO,
-opties, maten, kleuren en media-altteksten.
+  De automatisering vertaalt:
+  producttitel, volledige beschrijving,
+  SEO, maten, kleuren, opties en
+  afbeeldings-altteksten.
 </p>
 
 <p>
-De BF Size Charts worden na de productvertaling
-naar Frans bijgewerkt en productkoppelingen worden
-gesynchroniseerd met de nieuwe productnamen.
+  De BF Size Chart wordt na de
+  productvertaling aangepast.
 </p>
 
 <p>
-<strong>
-Prijzen, voorraad, SKU's, barcodes, handles,
-afbeeldingen en product-ID's worden niet gewijzigd.
-</strong>
+  <strong>
+    Prijzen, voorraad, SKU's,
+    barcodes, handles,
+    afbeeldingen en product-ID's
+    worden niet gewijzigd.
+  </strong>
 </p>
 
 <p>
-Productnamen:
-<strong>
-Franse voornaam | Franse productomschrijving
-</strong>
+  Productnaamstructuur:
+  <strong>
+    Franse voornaam |
+    Franse productomschrijving
+  </strong>
 </p>
 
 </div>
@@ -4374,11 +4147,11 @@ Franse voornaam | Franse productomschrijving
 <div class="card">
 
 <button id="test">
-Test 1 product
+  Test 1 product
 </button>
 
 <button id="start">
-Start alle producten
+  Start alle producten
 </button>
 
 </div>
@@ -4387,16 +4160,18 @@ Start alle producten
   id="status"
   class="card"
 >
-Status laden...
+  Status laden...
 </div>
 
 <div class="card">
 
 <h3>
-Log
+  Log
 </h3>
 
-<pre id="logs">
+<pre
+  id="logs"
+>
 Wachten...
 </pre>
 
@@ -4405,17 +4180,19 @@ Wachten...
 <script>
 
 const shop =
-${JSON.stringify(shop)};
+  ${JSON.stringify(
+    shop
+  )};
 
 const test =
-document.getElementById(
-  "test"
-);
+  document.getElementById(
+    "test"
+  );
 
 const start =
-document.getElementById(
-  "start"
-);
+  document.getElementById(
+    "start"
+  );
 
 async function refresh(){
 
@@ -4562,7 +4339,7 @@ start.onclick =
 
     if(
       !confirm(
-        "Dit start alle nog niet verwerkte producten en werkt daarna de BF Size Charts bij. Doorgaan?"
+        "Dit start alle nog niet verwerkte producten en werkt daarna de BF Size Chart bij. Doorgaan?"
       )
     ){
       return;
@@ -4634,7 +4411,7 @@ setInterval(
 );
 
 /* =========================================================
-   START ONE
+   TEST ONE PRODUCT
 ========================================================= */
 
 app.post(
@@ -4655,7 +4432,7 @@ app.post(
         .status(400)
         .json({
           error:
-            "Ongeldige Shopify shop.",
+            "Ongeldige shop."
         });
     }
 
@@ -4669,7 +4446,7 @@ app.post(
         .status(403)
         .json({
           error:
-            "Geen geldige sessie.",
+            "Geen geldige sessie."
         });
     }
 
@@ -4680,7 +4457,7 @@ app.post(
         .status(409)
         .json({
           error:
-            "Er draait al een job.",
+            "Er draait al een job."
         });
     }
 
@@ -4694,8 +4471,11 @@ app.post(
         ok:
           true,
 
+        originalTitle:
+          result.originalTitle,
+
         newTitle:
-          result.title,
+          result.newTitle,
       });
     } catch (
       error
@@ -4711,7 +4491,7 @@ app.post(
 );
 
 /* =========================================================
-   START ALL
+   START ALL PRODUCTS
 ========================================================= */
 
 app.post(
@@ -4732,7 +4512,7 @@ app.post(
         .status(400)
         .json({
           error:
-            "Ongeldige Shopify shop.",
+            "Ongeldige shop."
         });
     }
 
@@ -4746,7 +4526,7 @@ app.post(
         .status(403)
         .json({
           error:
-            "Geen geldige sessie.",
+            "Geen geldige sessie."
         });
     }
 
@@ -4757,7 +4537,7 @@ app.post(
         .status(409)
         .json({
           error:
-            "Er draait al een job.",
+            "Er draait al een job."
         });
     }
 
@@ -4770,7 +4550,7 @@ app.post(
         .status(401)
         .json({
           error:
-            "Shopify-token ontbreekt.",
+            "Shopify-token ontbreekt."
         });
     }
 
@@ -4781,7 +4561,7 @@ app.post(
         .status(500)
         .json({
           error:
-            "OPENAI_API_KEY ontbreekt.",
+            "OPENAI_API_KEY ontbreekt."
         });
     }
 
@@ -4827,7 +4607,7 @@ app.get(
         .status(403)
         .json({
           error:
-            "Geen geldige sessie.",
+            "Geen geldige sessie."
         });
     }
 
