@@ -1,5 +1,7 @@
 const express = require("express");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,16 +11,20 @@ const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const REDIRECT_URI = process.env.REDIRECT_URI;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
-
 const SHOPIFY_API_VERSION = "2026-07";
-const SHOPIFY_SCOPES = "write_products";
+const SCOPES = "write_products";
+const TOKEN_FILE =
+  process.env.TOKEN_FILE ||
+  path.join("/tmp", "maison-levara-tokens.json");
 
 const oauthStates = new Map();
-const shopTokens = new Map();
 const sessions = new Map();
+
+let tokens = loadTokens();
 
 const job = {
   running: false,
+  mode: null,
   shop: null,
   total: 0,
   pending: 0,
@@ -28,21 +34,21 @@ const job = {
   current: null,
   startedAt: null,
   finishedAt: null,
-  errors: [],
   logs: [],
+  errors: []
 };
 
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isValidShop(shop) {
+function validShop(shop) {
   return (
     typeof shop === "string" &&
-    /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i.test(shop)
+    /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/.test(shop)
   );
 }
 
@@ -68,28 +74,38 @@ function log(message) {
 }
 
 function parseCookies(req) {
-  const cookies = {};
+  const out = {};
 
-  for (const piece of (req.headers.cookie || "").split(";")) {
-    const i = piece.indexOf("=");
+  for (
+    const part of
+      (req.headers.cookie || "").split(";")
+  ) {
+    const i = part.indexOf("=");
 
     if (i < 0) {
       continue;
     }
 
-    cookies[piece.slice(0, i).trim()] =
-      decodeURIComponent(piece.slice(i + 1).trim());
+    out[
+      part.slice(0, i).trim()
+    ] =
+      decodeURIComponent(
+        part.slice(i + 1).trim()
+      );
   }
 
-  return cookies;
+  return out;
 }
 
 function setSession(res, shop) {
-  const id = crypto.randomBytes(32).toString("hex");
+  const id =
+    crypto.randomBytes(32).toString("hex");
 
   sessions.set(id, {
     shop,
-    expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+    expiresAt:
+      Date.now() +
+      24 * 60 * 60 * 1000
   });
 
   res.setHeader(
@@ -100,20 +116,25 @@ function setSession(res, shop) {
   );
 }
 
-function sessionShop(req) {
-  const id = parseCookies(req).ml_session;
+function getSessionShop(req) {
+  const id =
+    parseCookies(req).ml_session;
 
   if (!id) {
     return null;
   }
 
-  const session = sessions.get(id);
+  const session =
+    sessions.get(id);
 
   if (!session) {
     return null;
   }
 
-  if (session.expiresAt < Date.now()) {
+  if (
+    session.expiresAt <
+    Date.now()
+  ) {
     sessions.delete(id);
     return null;
   }
@@ -121,69 +142,155 @@ function sessionShop(req) {
   return session.shop;
 }
 
-function verifyHmac(query) {
-  const { hmac, ...params } = query;
+function loadTokens() {
+  try {
+    if (!fs.existsSync(TOKEN_FILE)) {
+      return new Map();
+    }
 
-  if (!hmac || !CLIENT_SECRET) {
+    return new Map(
+      Object.entries(
+        JSON.parse(
+          fs.readFileSync(
+            TOKEN_FILE,
+            "utf8"
+          )
+        )
+      )
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+function saveTokens() {
+  try {
+    fs.mkdirSync(
+      path.dirname(TOKEN_FILE),
+      {
+        recursive: true
+      }
+    );
+
+    fs.writeFileSync(
+      TOKEN_FILE,
+      JSON.stringify(
+        Object.fromEntries(tokens),
+        null,
+        2
+      ),
+      {
+        mode: 0o600
+      }
+    );
+  } catch (error) {
+    log(
+      `Token-opslag niet beschikbaar: ${error.message}`
+    );
+  }
+}
+
+function verifyHmac(query) {
+  const {
+    hmac,
+    ...params
+  } = query;
+
+  if (
+    !hmac ||
+    !CLIENT_SECRET
+  ) {
     return false;
   }
 
-  const message = Object.keys(params)
-    .sort()
-    .map((key) => `${key}=${params[key]}`)
-    .join("&");
+  const message =
+    Object.keys(params)
+      .sort()
+      .map(
+        (key) =>
+          `${key}=${params[key]}`
+      )
+      .join("&");
 
-  const digest = crypto
-    .createHmac("sha256", CLIENT_SECRET)
-    .update(message)
-    .digest("hex");
+  const digest =
+    crypto
+      .createHmac(
+        "sha256",
+        CLIENT_SECRET
+      )
+      .update(message)
+      .digest("hex");
 
   try {
     return crypto.timingSafeEqual(
       Buffer.from(digest),
-      Buffer.from(String(hmac))
+      Buffer.from(
+        String(hmac)
+      )
     );
   } catch {
     return false;
   }
 }
 
+/* =========================================================
+   SHOPIFY GRAPHQL
+========================================================= */
+
 async function shopifyGraphQL(
   shop,
-  accessToken,
+  token,
   query,
   variables = {}
 ) {
   let lastError = null;
 
-  for (let attempt = 0; attempt < 6; attempt++) {
+  for (
+    let attempt = 0;
+    attempt < 6;
+    attempt++
+  ) {
     try {
-      const response = await fetch(
-        `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
-        {
-          method: "POST",
+      const response =
+        await fetch(
+          `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+          {
+            method: "POST",
 
-          headers: {
-            "Content-Type": "application/json",
-            "X-Shopify-Access-Token": accessToken,
-          },
+            headers: {
+              "Content-Type":
+                "application/json",
 
-          body: JSON.stringify({
-            query,
-            variables,
-          }),
-        }
-      );
+              "X-Shopify-Access-Token":
+                token
+            },
 
-      const body = await response.json();
-
-      if (response.status === 429) {
-        lastError = new Error(
-          "Shopify rate limit."
+            body:
+              JSON.stringify({
+                query,
+                variables
+              })
+          }
         );
 
+      const body =
+        await response.json();
+
+      if (
+        response.status ===
+        429
+      ) {
+        lastError =
+          new Error(
+            "Shopify rate limit"
+          );
+
         await sleep(
-          1000 * 2 ** attempt
+          Math.min(
+            15000,
+            1000 *
+              2 ** attempt
+          )
         );
 
         continue;
@@ -197,34 +304,59 @@ async function shopifyGraphQL(
         );
       }
 
-      if (body.errors?.length) {
-        const message = body.errors
-          .map((error) => error.message)
-          .join(" | ");
+      if (
+        body.errors?.length
+      ) {
+        const message =
+          body.errors
+            .map(
+              (x) =>
+                x.message
+            )
+            .join(" | ");
 
-        if (/throttl/i.test(message)) {
-          lastError = new Error(message);
+        if (
+          /throttl/i.test(
+            message
+          )
+        ) {
+          lastError =
+            new Error(
+              message
+            );
 
           await sleep(
-            1000 * 2 ** attempt
+            Math.min(
+              15000,
+              1000 *
+                2 ** attempt
+            )
           );
 
           continue;
         }
 
-        throw new Error(message);
+        throw new Error(
+          message
+        );
       }
 
       return body.data;
     } catch (error) {
       lastError = error;
 
-      if (attempt === 5) {
+      if (
+        attempt === 5
+      ) {
         break;
       }
 
       await sleep(
-        1000 * 2 ** attempt
+        Math.min(
+          15000,
+          1000 *
+            2 ** attempt
+        )
       );
     }
   }
@@ -232,92 +364,437 @@ async function shopifyGraphQL(
   throw (
     lastError ||
     new Error(
-      "Shopify request failed."
+      "Shopify API request failed"
     )
   );
 }
 
+/* =========================================================
+   PRODUCT DATA
+========================================================= */
+
+const PRODUCTS_QUERY = `
+  query Products($after: String) {
+    products(first: 100, after: $after) {
+      nodes {
+        id
+        title
+        handle
+        productType
+        descriptionHtml
+
+        seo {
+          title
+          description
+        }
+
+        options {
+          id
+          name
+          position
+
+          optionValues {
+            id
+            name
+            hasVariants
+            linkedMetafieldValue
+          }
+        }
+
+        media(first: 100) {
+          nodes {
+            id
+            alt
+            mediaContentType
+          }
+        }
+
+        metafields(first: 100) {
+          nodes {
+            id
+            namespace
+            key
+            type
+            value
+          }
+        }
+      }
+
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+`;
+
 async function getAllProducts(
   shop,
-  accessToken
+  token
 ) {
   const products = [];
 
   let after = null;
-  let hasNextPage = true;
 
-  const query = `
-    query GetProducts($after: String) {
-      products(
-        first: 100
-        after: $after
-      ) {
-        nodes {
-          id
-          title
-          handle
-          descriptionHtml
-
-          seo {
-            title
-            description
-          }
-
-          options {
-            id
-            name
-            position
-
-            optionValues {
-              id
-              name
-            }
-          }
-
-          metafields(
-            first: 10
-            namespace: "maison_levara"
-          ) {
-            nodes {
-              namespace
-              key
-              value
-            }
-          }
-        }
-
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
-      }
-    }
-  `;
-
-  while (hasNextPage) {
+  while (true) {
     const data =
       await shopifyGraphQL(
         shop,
-        accessToken,
-        query,
-        { after }
+        token,
+        PRODUCTS_QUERY,
+        {
+          after
+        }
       );
 
     products.push(
       ...data.products.nodes
     );
 
-    hasNextPage =
-      data.products.pageInfo.hasNextPage;
+    if (
+      !data.products
+        .pageInfo
+        .hasNextPage
+    ) {
+      break;
+    }
 
     after =
-      data.products.pageInfo.endCursor;
+      data.products
+        .pageInfo
+        .endCursor;
   }
 
   return products;
 }
 
-const FRENCH_FIRST_NAMES = [
+/* =========================================================
+   BF SIZE CHART
+   READ-ONLY DIAGNOSTIC
+========================================================= */
+
+async function getShopBFMetafield(
+  shop,
+  token
+) {
+  const query = `
+    query BFSizeChart {
+      shop {
+        id
+
+        metafield(
+          namespace: "sizechartsrelentless"
+          key: "size_charts"
+        ) {
+          id
+          namespace
+          key
+          type
+          value
+          compareDigest
+        }
+      }
+    }
+  `;
+
+  const data =
+    await shopifyGraphQL(
+      shop,
+      token,
+      query
+    );
+
+  return data.shop;
+}
+
+/* =========================================================
+   HTML PROTECTION
+========================================================= */
+
+function protectHtml(
+  html
+) {
+  const tags = [];
+  const attrs = [];
+
+  let source =
+    String(html || "");
+
+  source =
+    source.replace(
+      /<[^>]*>/g,
+      (tag) => {
+        let safeTag = tag;
+
+        safeTag =
+          safeTag.replace(
+            /\b(alt|title)\s*=\s*(["'])([\s\S]*?)\2/gi,
+            (
+              full,
+              name,
+              quote,
+              value
+            ) => {
+              const id =
+                attrs.length;
+
+              const token =
+                `___ML_ATTR_${String(
+                  id
+                ).padStart(
+                  5,
+                  "0"
+                )}___`;
+
+              attrs.push({
+                id,
+                name:
+                  name.toLowerCase(),
+                value
+              });
+
+              return `${name}=${quote}${token}${quote}`;
+            }
+          );
+
+        const token =
+          `___ML_TAG_${String(
+            tags.length
+          ).padStart(
+            5,
+            "0"
+          )}___`;
+
+        tags.push({
+          token,
+          tag:
+            safeTag
+        });
+
+        return token;
+      }
+    );
+
+  return {
+    html:
+      source,
+    tags,
+    attrs
+  };
+}
+
+function restoreHtml(
+  translated,
+  prepared,
+  translatedAttrs
+) {
+  let html =
+    String(
+      translated || ""
+    );
+
+  const map =
+    new Map(
+      (
+        translatedAttrs ||
+        []
+      ).map(
+        (x) => [
+          Number(
+            x.id
+          ),
+          String(
+            x.value || ""
+          )
+        ]
+      )
+    );
+
+  for (
+    const attr of
+      prepared.attrs
+  ) {
+    let value =
+      map.has(
+        attr.id
+      )
+        ? map.get(
+            attr.id
+          )
+        : attr.value;
+
+    value =
+      value
+        .replace(
+          /&/g,
+          "&amp;"
+        )
+        .replace(
+          /"/g,
+          "&quot;"
+        )
+        .replace(
+          /</g,
+          "&lt;"
+        )
+        .replace(
+          />/g,
+          "&gt;"
+        );
+
+    const token =
+      `___ML_ATTR_${String(
+        attr.id
+      ).padStart(
+        5,
+        "0"
+      )}___`;
+
+    if (
+      html.split(
+        token
+      ).length -
+        1 !==
+      1
+    ) {
+      throw new Error(
+        `HTML-attribuut ${token} ontbreekt of is dubbel.`
+      );
+    }
+
+    html =
+      html.replace(
+        token,
+        value
+      );
+  }
+
+  for (
+    const item of
+      prepared.tags
+  ) {
+    if (
+      html.split(
+        item.token
+      ).length -
+        1 !==
+      1
+    ) {
+      throw new Error(
+        `HTML-tag ${item.token} ontbreekt of is dubbel.`
+      );
+    }
+
+    html =
+      html.replace(
+        item.token,
+        item.tag
+      );
+  }
+
+  if (
+    /___ML_(TAG|ATTR)_\d{5}___/.test(
+      html
+    )
+  ) {
+    throw new Error(
+      "Onopgeloste HTML-placeholder gevonden."
+    );
+  }
+
+  return html;
+}
+
+function htmlTags(
+  html
+) {
+  return [
+    ...String(
+      html || ""
+    ).matchAll(
+      /<\s*(\/?)\s*([a-zA-Z0-9]+)/g
+    )
+  ].map(
+    (m) =>
+      `${m[1] ? "/" : ""}${m[2].toLowerCase()}`
+  );
+}
+
+function htmlUrls(
+  html
+) {
+  return [
+    ...String(
+      html || ""
+    ).matchAll(
+      /\b(?:href|src)\s*=\s*["']([^"']+)["']/gi
+    )
+  ]
+    .map(
+      (m) =>
+        m[1]
+    )
+    .sort();
+}
+
+function sameArray(
+  a,
+  b
+) {
+  return (
+    a.length ===
+      b.length &&
+    a.every(
+      (
+        value,
+        index
+      ) =>
+        value ===
+        b[index]
+    )
+  );
+}
+
+function assertHtmlSafe(
+  before,
+  after
+) {
+  if (
+    !sameArray(
+      htmlTags(
+        before
+      ),
+      htmlTags(
+        after
+      )
+    )
+  ) {
+    throw new Error(
+      "HTML-structuur is gewijzigd."
+    );
+  }
+
+  if (
+    !sameArray(
+      htmlUrls(
+        before
+      ),
+      htmlUrls(
+        after
+      )
+    )
+  ) {
+    throw new Error(
+      "Een href/src URL is gewijzigd."
+    );
+  }
+}
+
+/* =========================================================
+   FRENCH PRODUCT NAMING
+========================================================= */
+
+const FRENCH_NAMES = [
   "Adèle",
   "Agathe",
   "Agnès",
@@ -427,179 +904,116 @@ const FRENCH_FIRST_NAMES = [
   "Victoire",
   "Virginie",
   "Yasmine",
-  "Zoé",
+  "Zoé"
 ];
 
-const FRENCH_NAME_KEYS =
+const FRENCH_KEYS =
   new Set(
-    FRENCH_FIRST_NAMES.map(
+    FRENCH_NAMES.map(
       normalize
     )
   );
 
-function chooseFallbackName(
-  reservedTitles,
-  seed
+function fallbackName(
+  index,
+  used
 ) {
   for (
     let i = 0;
-    i < FRENCH_FIRST_NAMES.length;
+    i <
+    FRENCH_NAMES.length;
     i++
   ) {
     const name =
-      FRENCH_FIRST_NAMES[
-        (seed + i) %
-          FRENCH_FIRST_NAMES.length
+      FRENCH_NAMES[
+        (index + i) %
+          FRENCH_NAMES.length
       ];
 
     const prefix =
-      `${normalize(name)} |`;
+      normalize(name) +
+      " |";
 
-    const used =
-      [...reservedTitles].some(
+    const alreadyUsed =
+      [...used].some(
         (title) =>
-          normalize(title).startsWith(
+          normalize(
+            title
+          ).startsWith(
             prefix
           )
       );
 
-    if (!used) {
+    if (
+      !alreadyUsed
+    ) {
       return name;
     }
   }
 
-  return FRENCH_FIRST_NAMES[
-    seed %
-      FRENCH_FIRST_NAMES.length
+  return FRENCH_NAMES[
+    index %
+      FRENCH_NAMES.length
   ];
 }
 
-function protectHtml(html) {
-  const tags = [];
+/* =========================================================
+   OPENAI
+========================================================= */
 
-  const protectedHtml =
-    String(html || "").replace(
-      /<[^>]*>/g,
-      (tag) => {
-        const token =
-          `___ML_HTML_TAG_${String(
-            tags.length
-          ).padStart(5, "0")}___`;
-
-        tags.push({
-          token,
-          tag,
-        });
-
-        return token;
-      }
-    );
-
-  return {
-    protectedHtml,
-    tags,
-  };
-}
-
-function restoreHtml(
-  translated,
-  tags
-) {
-  let result =
-    String(translated || "");
-
-  for (
-    const {
-      token,
-      tag,
-    } of tags
-  ) {
-    const count =
-      result.split(token)
-        .length - 1;
-
-    if (count !== 1) {
-      throw new Error(
-        `HTML-structuur beschadigd bij ${token}.`
-      );
-    }
-
-    result =
-      result.replace(
-        token,
-        tag
-      );
-  }
-
-  if (
-    /___ML_HTML_TAG_\d{5}___/.test(
-      result
-    )
-  ) {
-    throw new Error(
-      "HTML-placeholder ontbreekt of is aangepast."
-    );
-  }
-
-  return result;
-}
-
-function buildTitle(
-  firstName,
-  descriptor
-) {
-  const first =
-    String(
-      firstName || ""
-    )
-      .replace(/\|/g, " ")
-      .trim();
-
-  const desc =
-    String(
-      descriptor || ""
-    )
-      .replace(/\|/g, " ")
-      .trim();
-
-  return `${first} | ${desc}`.trim();
-}
-
-function isDone(product) {
-  return product.metafields.nodes.some(
-    (metafield) =>
-      metafield.namespace ===
-        "maison_levara" &&
-      metafield.key ===
-        "fr_translation_v1" &&
-      metafield.value === "done"
-  );
-}
-
-const translationSchema = {
+const AI_SCHEMA = {
   type: "object",
 
   additionalProperties: false,
 
   properties: {
     firstName: {
-      type: "string",
+      type: "string"
     },
 
     descriptor: {
-      type: "string",
+      type: "string"
+    },
+
+    productType: {
+      type: "string"
     },
 
     descriptionHtml: {
-      type: "string",
+      type: "string"
     },
 
     seoTitle: {
-      type: "string",
+      type: "string"
     },
 
     seoDescription: {
-      type: "string",
+      type: "string"
+    },
+
+    htmlAttributes: {
+      type: "array",
+
+      items: {
+        type: "object",
+
+        additionalProperties: false,
+
+        properties: {
+          id: {
+            type: "integer"
+          },
+
+          value: {
+            type: "string"
+          }
+        },
+
+        required: [
+          "id",
+          "value"
+        ]
+      }
     },
 
     options: {
@@ -612,11 +1026,11 @@ const translationSchema = {
 
         properties: {
           index: {
-            type: "integer",
+            type: "integer"
           },
 
           name: {
-            type: "string",
+            type: "string"
           },
 
           values: {
@@ -629,167 +1043,156 @@ const translationSchema = {
 
               properties: {
                 id: {
-                  type: "string",
+                  type: "string"
                 },
 
                 name: {
-                  type: "string",
-                },
+                  type: "string"
+                }
               },
 
               required: [
                 "id",
-                "name",
-              ],
-            },
-          },
+                "name"
+              ]
+            }
+          }
         },
 
         required: [
           "index",
           "name",
-          "values",
-        ],
-      },
+          "values"
+        ]
+      }
     },
+
+    media: {
+      type: "array",
+
+      items: {
+        type: "object",
+
+        additionalProperties: false,
+
+        properties: {
+          id: {
+            type: "string"
+          },
+
+          alt: {
+            type: "string"
+          }
+        },
+
+        required: [
+          "id",
+          "alt"
+        ]
+      }
+    }
   },
 
   required: [
     "firstName",
     "descriptor",
+    "productType",
     "descriptionHtml",
     "seoTitle",
     "seoDescription",
+    "htmlAttributes",
     "options",
-  ],
+    "media"
+  ]
 };
 
 const SYSTEM_PROMPT = `
-Je bent de vaste Franse e-commerce copywriter van Maison Lévara Paris.
+Je bent de vaste Franse productcopywriter van Maison Lévara Paris.
 
-VERTAAL ALLE KLANTZICHTBARE PRODUCTINHOUD NAAR NATUURLIJK, PROFESSIONEEL FRANS.
+Vertaal alle klantzichtbare productinhoud naar natuurlijk, professioneel Frans.
 
 PRODUCTNAAM:
 Gebruik exact:
 "Franse voornaam | Franse productomschrijving"
 
-De eerste helft moet een echte Franse voornaam zijn.
-De tweede helft is een korte natuurlijke Franse productomschrijving.
+Gebruik alleen een echte Franse voornaam.
 
-Gebruik geen Nederlandse, Engelse, Italiaanse of Spaanse woorden in de producttitel.
+De descriptor moet:
+- kort zijn
+- natuurlijk Frans zijn
+- duidelijk maken wat het product is
+- passen bij een moderne Franse fashionstore
 
-De stijl moet passen bij een Europese fashionstore en bij de productnaamstructuur die we voor Luno Milano gebruikten.
+De volledige producttitel moet uniek zijn binnen de volledige catalogus.
+
+Gebruik geen Nederlandse, Italiaanse, Engelse of Spaanse productnaam.
 
 BESCHRIJVING:
-Vertaal alle zichtbare producttekst naar Frans.
+Vertaal alle zichtbare tekst naar Frans.
 
-Dit geldt ook voor:
+Dit omvat:
+- normale producttekst
+- tabellen
 - maattabellen
 - tabelkoppen
-- tabeltekst
-- zichtbare tekst in HTML
-- normale tekst in alt/title-attributen
+- maatinformatie
+- kleurinformatie
 
-Behoud exact:
-- HTML-tags
-- HTML-placeholders
-- href-URLs
-- src-URLs
+HTML:
+De aangeleverde HTML-placeholders moeten exact blijven bestaan.
+
+Wijzig nooit:
+- href
+- src
+- URLs
 - classes
 - ids
 - data-attributen
 - cijfers
-- maten
 - percentages
+- afmetingen
 - eenheden
+- SKU's
 - productcodes
 - technische codes
 
 Voeg geen HTML-tags toe.
 Verwijder geen HTML-tags.
-Wijzig geen URL's.
 
-XS, S, M, L, XL, XXL en numerieke maten blijven als maatcodes bestaan.
-"One Size" wordt "Taille unique".
+ALT EN TITLE:
+Vertaal normale klantzichtbare alt- en title-tekst naar Frans.
 
 OPTIES:
 Size -> Taille
 Color -> Couleur
+Colour -> Couleur
 Material -> Matière
 
-Vertaal gewone kleurwaarden naar natuurlijk Frans.
-Vertaal gewone tekstuele waarden naar natuurlijk Frans.
-Laat numerieke maten en standaard maatcodes intact.
+Vertaal normale kleurwaarden naar natuurlijk Frans.
+
+Laat:
+XS
+S
+M
+L
+XL
+XXL
+en numerieke maten intact.
+
+One Size -> Taille unique.
+
+PRODUCTTYPE:
+Vertaal het producttype naar Frans.
 
 SEO:
 Vertaal SEO title en SEO description naar natuurlijk Frans.
 Geen keyword stuffing.
 
-UNIEKE PRODUCTNAAM:
-De volledige uiteindelijke titel mag niet dubbel voorkomen in de catalogus.
+MEDIA:
+Vertaal alt-teksten.
+
+Geef uitsluitend JSON conform het schema terug.
 `;
-
-function productPayload(
-  product,
-  reservedTitles,
-  htmlData
-) {
-  return {
-    currentTitle:
-      product.title,
-
-    descriptionHtml:
-      htmlData.protectedHtml,
-
-    htmlPlaceholders:
-      htmlData.tags.map(
-        (item) =>
-          item.token
-      ),
-
-    seo: {
-      title:
-        product.seo?.title || "",
-
-      description:
-        product.seo?.description ||
-        "",
-    },
-
-    existingCatalogTitles:
-      [...reservedTitles].slice(
-        0,
-        150
-      ),
-
-    options:
-      product.options.map(
-        (
-          option,
-          index
-        ) => ({
-          index,
-
-          id:
-            option.id,
-
-          name:
-            option.name,
-
-          values:
-            option.optionValues.map(
-              (value) => ({
-                id:
-                  value.id,
-
-                name:
-                  value.name,
-              })
-            ),
-        })
-      ),
-  };
-}
 
 function extractOutputText(
   body
@@ -832,13 +1235,16 @@ function extractOutputText(
 async function openAIJson(
   payload
 ) {
-  if (!OPENAI_API_KEY) {
+  if (
+    !OPENAI_API_KEY
+  ) {
     throw new Error(
       "OPENAI_API_KEY ontbreekt in Render."
     );
   }
 
-  let lastError = null;
+  let lastError =
+    null;
 
   for (
     let attempt = 0;
@@ -849,114 +1255,125 @@ async function openAIJson(
       const controller =
         new AbortController();
 
-      const timeout =
+      const timer =
         setTimeout(
           () =>
             controller.abort(),
           180000
         );
 
-      const response =
-        await fetch(
-          "https://api.openai.com/v1/responses",
-          {
-            method: "POST",
+      let response;
 
-            signal:
-              controller.signal,
+      try {
+        response =
+          await fetch(
+            "https://api.openai.com/v1/responses",
+            {
+              method: "POST",
 
-            headers: {
-              "Content-Type":
-                "application/json",
+              signal:
+                controller.signal,
 
-              Authorization:
-                `Bearer ${OPENAI_API_KEY}`,
-            },
+              headers: {
+                "Content-Type":
+                  "application/json",
 
-            body: JSON.stringify({
-              model:
-                OPENAI_MODEL,
-
-              store: false,
-
-              reasoning: {
-                effort:
-                  "minimal",
+                Authorization:
+                  `Bearer ${OPENAI_API_KEY}`
               },
 
-              input: [
-                {
-                  role: "system",
+              body:
+                JSON.stringify({
+                  model:
+                    OPENAI_MODEL,
 
-                  content: [
+                  store:
+                    false,
+
+                  input: [
                     {
-                      type:
-                        "input_text",
+                      role:
+                        "system",
 
-                      text:
-                        SYSTEM_PROMPT,
+                      content: [
+                        {
+                          type:
+                            "input_text",
+
+                          text:
+                            SYSTEM_PROMPT
+                        }
+                      ]
                     },
-                  ],
-                },
 
-                {
-                  role: "user",
-
-                  content: [
                     {
-                      type:
-                        "input_text",
+                      role:
+                        "user",
 
-                      text:
-                        JSON.stringify(
-                          payload
-                        ),
-                    },
+                      content: [
+                        {
+                          type:
+                            "input_text",
+
+                          text:
+                            JSON.stringify(
+                              payload
+                            )
+                        }
+                      ]
+                    }
                   ],
-                },
-              ],
 
-              text: {
-                format: {
-                  type:
-                    "json_schema",
+                  text: {
+                    format: {
+                      type:
+                        "json_schema",
 
-                  name:
-                    "maison_levara_translation",
+                      name:
+                        "maison_levara_product_translation",
 
-                  strict:
-                    true,
+                      strict:
+                        true,
 
-                  schema:
-                    translationSchema,
-                },
-              },
-            }),
-          }
+                      schema:
+                        AI_SCHEMA
+                    }
+                  }
+                })
+            }
+          );
+      } finally {
+        clearTimeout(
+          timer
         );
-
-      clearTimeout(timeout);
+      }
 
       const body =
         await response.json();
 
       if (
-        response.status === 429
+        response.status ===
+        429
       ) {
         lastError =
           new Error(
-            "OpenAI rate limit."
+            "OpenAI rate limit"
           );
 
         await sleep(
-          1500 *
-            2 ** attempt
+          Math.min(
+            20000,
+            1500 *
+              2 ** attempt
+          )
         );
 
         continue;
       }
 
-      if (!response.ok) {
+      if (
+        !response.ok
+      ) {
         throw new Error(
           `OpenAI HTTP ${response.status}: ${JSON.stringify(
             body
@@ -971,7 +1388,7 @@ async function openAIJson(
 
       if (!text) {
         throw new Error(
-          "OpenAI gaf geen bruikbaar resultaat terug."
+          "OpenAI gaf geen output terug."
         );
       }
 
@@ -989,8 +1406,11 @@ async function openAIJson(
       }
 
       await sleep(
-        1500 *
-          2 ** attempt
+        Math.min(
+          20000,
+          1500 *
+            2 ** attempt
+        )
       );
     }
   }
@@ -1008,31 +1428,92 @@ async function translateProduct(
   reservedTitles,
   index
 ) {
-  const htmlData =
+  const prepared =
     protectHtml(
       product.descriptionHtml ||
         ""
     );
 
-  let rejectedTitle =
-    "";
+  const payload = {
+    currentTitle:
+      product.title,
+
+    currentProductType:
+      product.productType ||
+      "",
+
+    descriptionHtml:
+      prepared.html,
+
+    htmlAttributes:
+      prepared.attrs,
+
+    seo:
+      product.seo || {
+        title: "",
+        description: ""
+      },
+
+    options:
+      product.options.map(
+        (
+          option,
+          optionIndex
+        ) => ({
+          index:
+            optionIndex,
+
+          id:
+            option.id,
+
+          name:
+            option.name,
+
+          values:
+            option.optionValues.map(
+              (value) => ({
+                id:
+                  value.id,
+
+                name:
+                  value.name
+              })
+            )
+        })
+      ),
+
+    media:
+      product.media.nodes.map(
+        (item) => ({
+          id:
+            item.id,
+
+          alt:
+            item.alt ||
+            ""
+        })
+      ),
+
+    existingTitles:
+      [
+        ...reservedTitles
+      ].slice(
+        0,
+        200
+      )
+  };
 
   for (
     let attempt = 0;
     attempt < 6;
     attempt++
   ) {
-    const payload =
-      productPayload(
-        product,
-        reservedTitles,
-        htmlData
-      );
-
-    payload.retryInstruction =
-      rejectedTitle
-        ? `De vorige titel was niet toegestaan omdat hij al bestond: ${rejectedTitle}. Kies een andere Franse titel.`
-        : "";
+    if (
+      attempt
+    ) {
+      payload.retry =
+        `De vorige titel "${payload.previousTitle}" was al bezet. Kies beslist een andere Franse productnaam.`;
+    }
 
     const result =
       await openAIJson(
@@ -1046,56 +1527,79 @@ async function translateProduct(
       ).trim();
 
     if (
-      !FRENCH_NAME_KEYS.has(
+      !FRENCH_KEYS.has(
         normalize(
           firstName
         )
       )
     ) {
       firstName =
-        chooseFallbackName(
-          reservedTitles,
+        fallbackName(
           index +
-            attempt
+            attempt,
+          reservedTitles
         );
     }
 
-    const title =
-      buildTitle(
-        firstName,
-        result.descriptor
-      );
+    const descriptor =
+      String(
+        result.descriptor ||
+          ""
+      )
+        .replace(
+          /\|/g,
+          " "
+        )
+        .trim();
 
-    const titleKey =
+    const title =
+      `${firstName} | ${descriptor}`.trim();
+
+    const key =
       normalize(
         title
       );
 
+    payload.previousTitle =
+      title;
+
     if (
-      !title.includes("|") ||
-      !result.descriptor?.trim() ||
+      !descriptor ||
+      !title.includes(
+        "|"
+      ) ||
       reservedTitles.has(
-        titleKey
+        key
       )
     ) {
-      rejectedTitle =
-        title;
-
       continue;
     }
 
     const descriptionHtml =
       restoreHtml(
         result.descriptionHtml,
-        htmlData.tags
+        prepared,
+        result.htmlAttributes
       );
 
+    assertHtmlSafe(
+      product.descriptionHtml ||
+        "",
+      descriptionHtml
+    );
+
     reservedTitles.add(
-      titleKey
+      key
     );
 
     return {
       title,
+
+      productType:
+        String(
+          result.productType ||
+            ""
+        ).trim(),
 
       descriptionHtml,
 
@@ -1117,21 +1621,32 @@ async function translateProduct(
         )
           ? result.options
           : [],
+
+      media:
+        Array.isArray(
+          result.media
+        )
+          ? result.media
+          : []
     };
   }
 
   throw new Error(
-    `Geen unieke Franse productnaam kunnen genereren voor ${product.title}.`
+    `Geen unieke Franse productnaam voor ${product.title}`
   );
 }
 
+/* =========================================================
+   PRODUCT UPDATES
+========================================================= */
+
 async function updateProduct(
   shop,
-  accessToken,
+  token,
   product,
-  translation
+  translated
 ) {
-  const productMutation = `
+  const mutation = `
     mutation UpdateProduct(
       $product: ProductUpdateInput!
     ) {
@@ -1147,6 +1662,7 @@ async function updateProduct(
         product {
           id
           title
+          productType
           handle
         }
       }
@@ -1156,27 +1672,31 @@ async function updateProduct(
   const data =
     await shopifyGraphQL(
       shop,
-      accessToken,
-      productMutation,
+      token,
+      mutation,
       {
         product: {
           id:
             product.id,
 
           title:
-            translation.title,
+            translated.title,
+
+          productType:
+            translated.productType ||
+            product.productType,
 
           descriptionHtml:
-            translation.descriptionHtml,
+            translated.descriptionHtml,
 
           seo: {
             title:
-              translation.seoTitle,
+              translated.seoTitle,
 
             description:
-              translation.seoDescription,
-          },
-        },
+              translated.seoDescription
+          }
+        }
       }
     );
 
@@ -1184,33 +1704,45 @@ async function updateProduct(
     data.productUpdate
       .userErrors || [];
 
-  if (errors.length) {
+  if (
+    errors.length
+  ) {
     throw new Error(
       errors
         .map(
-          (error) =>
-            error.message
+          (e) =>
+            e.message
         )
         .join(" | ")
     );
   }
+}
 
+async function updateOptions(
+  shop,
+  token,
+  product,
+  translated
+) {
   for (
     const option of
       product.options
   ) {
-    const translated =
-      translation.options.find(
-        (item) =>
+    const translatedOption =
+      translated.options.find(
+        (x) =>
           Number(
-            item.index
+            x.index
           ) ===
           Number(
-            option.position - 1
+            option.position -
+              1
           )
       );
 
-    if (!translated) {
+    if (
+      !translatedOption
+    ) {
       continue;
     }
 
@@ -1220,7 +1752,7 @@ async function updateProduct(
           (original) => {
             const match =
               (
-                translated.values ||
+                translatedOption.values ||
                 []
               ).find(
                 (value) =>
@@ -1254,32 +1786,33 @@ async function updateProduct(
               id:
                 original.id,
 
-              name,
+              name
             };
           }
         )
-        .filter(Boolean);
+        .filter(
+          Boolean
+        );
 
-    const optionName =
+    const name =
       String(
-        translated.name ||
+        translatedOption.name ||
           ""
       ).trim();
 
     const nameChanged =
-      optionName &&
-      optionName !==
+      name &&
+      name !==
         option.name.trim();
 
     if (
       !nameChanged &&
-      optionValuesToUpdate.length ===
-        0
+      !optionValuesToUpdate.length
     ) {
       continue;
     }
 
-    const optionMutation = `
+    const mutation = `
       mutation UpdateOption(
         $productId: ID!,
         $option: OptionUpdateInput!,
@@ -1288,8 +1821,7 @@ async function updateProduct(
         productOptionUpdate(
           productId: $productId,
           option: $option,
-          optionValuesToUpdate: $optionValuesToUpdate,
-          variantStrategy: LEAVE_AS_IS
+          optionValuesToUpdate: $optionValuesToUpdate
         ) {
           userErrors {
             field
@@ -1304,11 +1836,11 @@ async function updateProduct(
       }
     `;
 
-    const optionData =
+    const data =
       await shopifyGraphQL(
         shop,
-        accessToken,
-        optionMutation,
+        token,
+        mutation,
         {
           productId:
             product.id,
@@ -1318,28 +1850,30 @@ async function updateProduct(
               option.id,
 
             name:
-              optionName ||
+              name ||
               option.name,
 
             position:
-              option.position,
+              option.position
           },
 
-          optionValuesToUpdate,
+          optionValuesToUpdate
         }
       );
 
-    const optionErrors =
-      optionData
+    const errors =
+      data
         .productOptionUpdate
         .userErrors || [];
 
-    if (optionErrors.length) {
+    if (
+      errors.length
+    ) {
       throw new Error(
-        optionErrors
+        errors
           .map(
-            (error) =>
-              error.message
+            (e) =>
+              e.message
           )
           .join(" | ")
       );
@@ -1347,9 +1881,113 @@ async function updateProduct(
   }
 }
 
+async function updateMedia(
+  shop,
+  token,
+  product,
+  translated
+) {
+  const media =
+    translated.media
+      .filter(
+        (x) =>
+          x.id &&
+          typeof x.alt ===
+            "string"
+      )
+      .map(
+        (x) => ({
+          id:
+            x.id,
+
+          alt:
+            x.alt
+        })
+      )
+      .filter(
+        (x) => {
+          const original =
+            product.media.nodes.find(
+              (m) =>
+                m.id ===
+                x.id
+            );
+
+          return (
+            original &&
+            String(
+              original.alt ||
+                ""
+            ) !==
+              x.alt
+          );
+        }
+      );
+
+  if (
+    !media.length
+  ) {
+    return;
+  }
+
+  const mutation = `
+    mutation UpdateMedia(
+      $productId: ID!,
+      $media: [UpdateMediaInput!]!
+    ) {
+      productUpdateMedia(
+        productId: $productId,
+        media: $media
+      ) {
+        media {
+          id
+          alt
+        }
+
+        mediaUserErrors {
+          field
+          message
+          code
+        }
+      }
+    }
+  `;
+
+  const data =
+    await shopifyGraphQL(
+      shop,
+      token,
+      mutation,
+      {
+        productId:
+          product.id,
+
+        media
+      }
+    );
+
+  const errors =
+    data
+      .productUpdateMedia
+      .mediaUserErrors || [];
+
+  if (
+    errors.length
+  ) {
+    throw new Error(
+      errors
+        .map(
+          (e) =>
+            e.message
+        )
+        .join(" | ")
+    );
+  }
+}
+
 async function markDone(
   shop,
-  accessToken,
+  token,
   productId
 ) {
   const mutation = `
@@ -1371,7 +2009,7 @@ async function markDone(
   const data =
     await shopifyGraphQL(
       shop,
-      accessToken,
+      token,
       mutation,
       {
         metafields: [
@@ -1389,33 +2027,102 @@ async function markDone(
               "single_line_text_field",
 
             value:
-              "done",
-          },
-        ],
+              "done"
+          }
+        ]
       }
     );
 
   const errors =
-    data.metafieldsSet
+    data
+      .metafieldsSet
       .userErrors || [];
 
-  if (errors.length) {
+  if (
+    errors.length
+  ) {
     throw new Error(
       errors
         .map(
-          (error) =>
-            error.message
+          (e) =>
+            e.message
         )
         .join(" | ")
     );
   }
 }
 
-async function runTranslationJob(
+function isDone(
+  product
+) {
+  return product.metafields.nodes.some(
+    (x) =>
+      x.namespace ===
+        "maison_levara" &&
+      x.key ===
+        "fr_translation_v1" &&
+      x.value ===
+        "done"
+  );
+}
+
+async function processProduct(
+  shop,
+  token,
+  product,
+  reservedTitles,
+  index
+) {
+  const translated =
+    await translateProduct(
+      product,
+      reservedTitles,
+      index
+    );
+
+  log(
+    `${product.title} -> ${translated.title}`
+  );
+
+  await updateProduct(
+    shop,
+    token,
+    product,
+    translated
+  );
+
+  await updateOptions(
+    shop,
+    token,
+    product,
+    translated
+  );
+
+  await updateMedia(
+    shop,
+    token,
+    product,
+    translated
+  );
+
+  await markDone(
+    shop,
+    token,
+    product.id
+  );
+
+  return translated;
+}
+
+/* =========================================================
+   JOBS
+========================================================= */
+
+async function runTestOne(
   shop
 ) {
   const connection =
-    shopTokens.get(
+    tokens.get(
       shop
     );
 
@@ -1425,23 +2132,99 @@ async function runTranslationJob(
     );
   }
 
-  job.running = true;
-  job.shop = shop;
-  job.total = 0;
-  job.pending = 0;
-  job.processed = 0;
-  job.skipped = 0;
-  job.failed = 0;
-  job.current = null;
+  const products =
+    await getAllProducts(
+      shop,
+      connection.accessToken
+    );
+
+  const product =
+    products.find(
+      (p) =>
+        !isDone(p)
+    );
+
+  if (!product) {
+    throw new Error(
+      "Geen onvertaald product gevonden."
+    );
+  }
+
+  const reservedTitles =
+    new Set(
+      products.map(
+        (p) =>
+          normalize(
+            p.title
+          )
+      )
+    );
+
+  return processProduct(
+    shop,
+    connection.accessToken,
+    product,
+    reservedTitles,
+    0
+  );
+}
+
+async function runFullJob(
+  shop
+) {
+  const connection =
+    tokens.get(
+      shop
+    );
+
+  if (!connection) {
+    throw new Error(
+      "Shopify-token ontbreekt."
+    );
+  }
+
+  job.running =
+    true;
+
+  job.mode =
+    "full";
+
+  job.shop =
+    shop;
+
+  job.total =
+    0;
+
+  job.pending =
+    0;
+
+  job.processed =
+    0;
+
+  job.skipped =
+    0;
+
+  job.failed =
+    0;
+
+  job.current =
+    null;
+
   job.startedAt =
     new Date().toISOString();
-  job.finishedAt = null;
-  job.errors = [];
-  job.logs = [];
+
+  job.finishedAt =
+    null;
+
+  job.logs =
+    [];
+
+  job.errors =
+    [];
 
   try {
     log(
-      "Productcatalogus ophalen..."
+      "Alle producten ophalen..."
     );
 
     const products =
@@ -1457,18 +2240,20 @@ async function runTranslationJob(
       new Set(
         products
           .map(
-            (product) =>
+            (p) =>
               normalize(
-                product.title
+                p.title
               )
           )
-          .filter(Boolean)
+          .filter(
+            Boolean
+          )
       );
 
     const pending =
       products.filter(
-        (product) =>
-          !isDone(product)
+        (p) =>
+          !isDone(p)
       );
 
     job.pending =
@@ -1479,19 +2264,27 @@ async function runTranslationJob(
       pending.length;
 
     log(
-      `${products.length} producten gevonden.`
+      `${products.length} producten gevonden; ${pending.length} te verwerken.`
     );
 
-    log(
-      `${pending.length} producten moeten nog verwerkt worden.`
-    );
+    let cursor =
+      0;
 
-    let cursor = 0;
+    const workerCount =
+      Math.min(
+        4,
+        Math.max(
+          1,
+          pending.length
+        )
+      );
 
     async function worker(
       workerId
     ) {
-      while (true) {
+      while (
+        true
+      ) {
         const index =
           cursor++;
 
@@ -1512,43 +2305,26 @@ async function runTranslationJob(
           index:
             index + 1,
 
+          total:
+            pending.length,
+
           title:
-            product.title,
+            product.title
         };
 
         try {
-          log(
-            `Start ${index + 1}/${pending.length}: ${product.title}`
-          );
-
-          const translation =
-            await translateProduct(
-              product,
-              reservedTitles,
-              index
-            );
-
-          log(
-            `Nieuwe naam: ${translation.title}`
-          );
-
-          await updateProduct(
+          await processProduct(
             shop,
             connection.accessToken,
             product,
-            translation
-          );
-
-          await markDone(
-            shop,
-            connection.accessToken,
-            product.id
+            reservedTitles,
+            index
           );
 
           job.processed++;
 
           log(
-            `KLAAR ${index + 1}/${pending.length}: ${translation.title}`
+            `KLAAR ${index + 1}/${pending.length}: ${product.title}`
           );
         } catch (error) {
           job.failed++;
@@ -1560,32 +2336,34 @@ async function runTranslationJob(
             message
           );
 
-          if (
-            job.errors.length >
-            100
-          ) {
-            job.errors.shift();
-          }
-
           log(
             `FOUT: ${message}`
           );
         } finally {
-          job.current = null;
+          job.current =
+            null;
         }
       }
     }
 
-    await Promise.all([
-      worker(1),
-      worker(2),
-      worker(3),
-      worker(4),
-      worker(5),
-    ]);
+    await Promise.all(
+      Array.from(
+        {
+          length:
+            workerCount
+        },
+        (
+          _,
+          index
+        ) =>
+          worker(
+            index + 1
+          )
+      )
+    );
 
     log(
-      `JOB KLAAR — verwerkt: ${job.processed}, overgeslagen: ${job.skipped}, fouten: ${job.failed}.`
+      `JOB KLAAR — verwerkt ${job.processed}, overgeslagen ${job.skipped}, fouten ${job.failed}.`
     );
   } catch (error) {
     job.failed++;
@@ -1598,28 +2376,45 @@ async function runTranslationJob(
       `JOB FOUT: ${error.message}`
     );
   } finally {
-    job.running = false;
-    job.current = null;
+    job.running =
+      false;
+
+    job.current =
+      null;
+
     job.finishedAt =
       new Date().toISOString();
   }
 }
 
+/* =========================================================
+   BASIC ROUTES
+========================================================= */
+
 app.get(
   "/",
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
     res.send(
-      `<h1>Maison Lévara Paris</h1>
-       <p>Shopify API connection is online.</p>`
+      `
+      <h1>Maison Lévara Paris</h1>
+      <p>Shopify API is online.</p>
+      `
     );
   }
 );
 
 app.get(
   "/health",
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
     res.json({
-      ok: true,
+      ok:
+        true,
 
       shopifyConfigured:
         Boolean(
@@ -1636,20 +2431,30 @@ app.get(
       model:
         OPENAI_MODEL,
 
-      shopifyApiVersion:
+      apiVersion:
         SHOPIFY_API_VERSION,
+
+      scopes:
+        SCOPES
     });
   }
 );
 
+/* =========================================================
+   OAUTH
+========================================================= */
+
 app.get(
   "/auth",
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
     const shop =
       req.query.shop;
 
     if (
-      !isValidShop(shop)
+      !validShop(shop)
     ) {
       return res
         .status(400)
@@ -1672,8 +2477,12 @@ app.get(
 
     const state =
       crypto
-        .randomBytes(24)
-        .toString("hex");
+        .randomBytes(
+          24
+        )
+        .toString(
+          "hex"
+        );
 
     oauthStates.set(
       state,
@@ -1682,7 +2491,7 @@ app.get(
 
         expiresAt:
           Date.now() +
-          10 * 60 * 1000,
+          600000
       }
     );
 
@@ -1693,12 +2502,12 @@ app.get(
           CLIENT_ID,
 
         scope:
-          SHOPIFY_SCOPES,
+          SCOPES,
 
         redirect_uri:
           REDIRECT_URI,
 
-        state,
+        state
       }).toString();
 
     res.redirect(
@@ -1709,15 +2518,18 @@ app.get(
 
 app.get(
   "/auth/callback",
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     const {
       code,
       shop,
-      state,
+      state
     } = req.query;
 
     if (
-      !isValidShop(shop)
+      !validShop(shop)
     ) {
       return res
         .status(400)
@@ -1737,7 +2549,8 @@ app.get(
 
     if (
       !saved ||
-      saved.shop !== shop ||
+      saved.shop !==
+        shop ||
       saved.expiresAt <
         Date.now()
     ) {
@@ -1770,7 +2583,7 @@ app.get(
 
             headers: {
               "Content-Type":
-                "application/x-www-form-urlencoded",
+                "application/x-www-form-urlencoded"
             },
 
             body:
@@ -1781,8 +2594,8 @@ app.get(
                 client_secret:
                   CLIENT_SECRET,
 
-                code,
-              }),
+                code
+              })
           }
         );
 
@@ -1793,34 +2606,35 @@ app.get(
         !response.ok ||
         !data.access_token
       ) {
-        console.error(
-          data
-        );
-
         return res
           .status(500)
           .send(
-            "Shopify token-uitwisseling mislukt."
+            `Shopify token-uitwisseling mislukt: ${JSON.stringify(
+              data
+            )}`
           );
       }
 
-      shopTokens.set(
+      tokens.set(
         shop,
         {
           accessToken:
             data.access_token,
 
           scope:
-            data.scope,
+            data.scope
         }
       );
+
+      saveTokens();
 
       setSession(
         res,
         shop
       );
 
-      res.send(`
+      res.send(
+        `
         <h1>Shopify succesvol verbonden!</h1>
 
         <p>
@@ -1840,39 +2654,43 @@ app.get(
             Open vertaalbeheer
           </a>
         </p>
-      `);
-    } catch (error) {
-      console.error(
-        error
+        `
       );
-
+    } catch (error) {
       res
         .status(500)
         .send(
-          "Er ging iets mis met de Shopify-verbinding."
+          `Shopify verbinding mislukt: ${error.message}`
         );
     }
   }
 );
 
+/* =========================================================
+   PRODUCTS READ TEST
+========================================================= */
+
 app.get(
   "/products",
-  async (req, res) => {
+  async (
+    req,
+    res
+  ) => {
     const shop =
       req.query.shop;
 
     if (
-      !isValidShop(shop)
+      !validShop(shop)
     ) {
       return res
         .status(400)
         .send(
-          "Ongeldige Shopify shop."
+          "Ongeldige shop."
         );
     }
 
     const connection =
-      shopTokens.get(
+      tokens.get(
         shop
       );
 
@@ -1880,7 +2698,7 @@ app.get(
       return res
         .status(401)
         .send(
-          "Shopify is nog niet verbonden."
+          "Shopify is niet verbonden."
         );
     }
 
@@ -1902,79 +2720,216 @@ app.get(
               10
             )
             .map(
-              (product) => ({
+              (p) => ({
                 id:
-                  product.id,
+                  p.id,
 
                 title:
-                  product.title,
+                  p.title,
+
+                productType:
+                  p.productType,
 
                 handle:
-                  product.handle,
+                  p.handle,
 
                 options:
-                  product.options.map(
-                    (
-                      option
-                    ) => ({
+                  p.options.map(
+                    (o) => ({
                       name:
-                        option.name,
+                        o.name,
 
                       values:
-                        option.optionValues.map(
-                          (
-                            value
-                          ) =>
-                            value.name
-                        ),
+                        o.optionValues.map(
+                          (v) =>
+                            v.name
+                        )
                     })
                   ),
+
+                mediaCount:
+                  p.media.nodes
+                    .length,
+
+                metafieldCount:
+                  p.metafields.nodes
+                    .length,
+
+                translated:
+                  isDone(
+                    p
+                  )
               })
-            ),
+            )
+      });
+    } catch (error) {
+      res
+        .status(500)
+        .json({
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+/* =========================================================
+   BF DIAGNOSTIC
+   READ-ONLY
+========================================================= */
+
+app.get(
+  "/bf-diagnose",
+  async (
+    req,
+    res
+  ) => {
+    const shop =
+      req.query.shop;
+
+    if (
+      !validShop(shop)
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Ongeldige shop."
+        });
+    }
+
+    const connection =
+      tokens.get(
+        shop
+      );
+
+    if (!connection) {
+      return res
+        .status(401)
+        .json({
+          error:
+            "Shopify is niet verbonden."
+        });
+    }
+
+    try {
+      const shopData =
+        await getShopBFMetafield(
+          shop,
+          connection.accessToken
+        );
+
+      const metafield =
+        shopData.metafield;
+
+      if (
+        !metafield
+      ) {
+        return res
+          .status(404)
+          .json({
+            found:
+              false,
+
+            message:
+              "BF-metafield sizechartsrelentless.size_charts niet gevonden."
+          });
+      }
+
+      let parsed =
+        null;
+
+      try {
+        parsed =
+          JSON.parse(
+            metafield.value
+          );
+      } catch {
+        parsed =
+          null;
+      }
+
+      return res.json({
+        found:
+          true,
+
+        shopId:
+          shopData.id,
+
+        id:
+          metafield.id,
+
+        namespace:
+          metafield.namespace,
+
+        key:
+          metafield.key,
+
+        type:
+          metafield.type,
+
+        compareDigest:
+          metafield.compareDigest,
+
+        json:
+          parsed,
+
+        value:
+          parsed === null
+            ? metafield.value
+            : undefined
       });
     } catch (error) {
       console.error(
         error
       );
 
-      res
+      return res
         .status(500)
         .json({
           error:
-            error.message,
+            error.message
         });
     }
   }
 );
 
+/* =========================================================
+   ADMIN PAGE
+========================================================= */
+
 app.get(
   "/admin",
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
     const shop =
       req.query.shop;
 
     if (
-      !isValidShop(shop)
+      !validShop(shop)
     ) {
       return res
         .status(400)
         .send(
-          "Ongeldige Shopify shop."
+          "Ongeldige shop."
         );
     }
 
     if (
-      sessionShop(req) !==
+      getSessionShop(req) !==
       shop
     ) {
       return res
         .status(403)
         .send(
-          "Geen geldige sessie. Open eerst /auth?shop=..."
+          "Geen geldige sessie. Open eerst /auth."
         );
     }
 
-    res.send(`
+    res.send(
+      `
 <!doctype html>
 
 <html lang="nl">
@@ -1989,8 +2944,7 @@ app.get(
 >
 
 <title>
-  Maison Lévara —
-  Franse vertaling
+  Maison Lévara — Franse vertaling
 </title>
 
 <style>
@@ -2001,7 +2955,7 @@ body{
     sans-serif;
 
   max-width:
-    950px;
+    1000px;
 
   margin:
     40px auto;
@@ -2011,6 +2965,20 @@ body{
 
   color:
     #111;
+}
+
+.card{
+  background:
+    #f5f5f5;
+
+  padding:
+    20px;
+
+  border-radius:
+    10px;
+
+  margin:
+    18px 0;
 }
 
 button{
@@ -2023,45 +2991,31 @@ button{
   border:
     0;
 
-  padding:
-    14px 22px;
-
   border-radius:
     7px;
+
+  padding:
+    14px 20px;
+
+  margin:
+    5px 8px 5px 0;
 
   cursor:
     pointer;
 
   font-size:
-    16px;
+    15px;
 }
 
 button:disabled{
   opacity:
-    .5;
+    .45;
 
   cursor:
     not-allowed;
 }
 
-.card{
-  padding:
-    20px;
-
-  background:
-    #f5f5f5;
-
-  border-radius:
-    10px;
-
-  margin:
-    18px 0;
-}
-
 pre{
-  white-space:
-    pre-wrap;
-
   background:
     #111;
 
@@ -2069,13 +3023,16 @@ pre{
     #eee;
 
   padding:
-    15px;
+    16px;
 
   border-radius:
     8px;
 
+  white-space:
+    pre-wrap;
+
   max-height:
-    520px;
+    500px;
 
   overflow:
     auto;
@@ -2095,67 +3052,81 @@ pre{
   Franse productvertaling
 </h2>
 
-<p>
-  Shop:
-  <strong>
-    ${shop}
-  </strong>
-</p>
-
 <div class="card">
 
 <p>
-  Alle nog niet verwerkte producten
-  worden naar Frans vertaald.
+  <strong>Shop:</strong>
+  ${shop}
 </p>
 
 <p>
-  Producttitel, beschrijving, SEO,
-  optie-namen, maten en kleuren
-  worden verwerkt.
+  Producttitel, producttype,
+  volledige beschrijving, SEO,
+  opties, maten, kleuren en
+  media-altteksten worden vertaald.
 </p>
 
 <p>
-  Prijzen, voorraad, SKU's,
-  afbeeldingen en handles
-  worden niet gewijzigd.
+  <strong>Niet gewijzigd:</strong>
+  prijzen, voorraad, SKU's,
+  barcodes, handles,
+  afbeeldingen en ID's.
 </p>
 
 <p>
-  Producttitels volgen:
+  Productnaamstructuur:
   <strong>
     Franse voornaam |
     Franse productomschrijving
   </strong>
 </p>
 
+</div>
+
+<div class="card">
+
+<button id="test">
+  Test 1 product
+</button>
+
 <button id="start">
-  Start Franse vertaling
+  Start alle producten
 </button>
 
 </div>
 
 <div
-  class="card"
   id="status"
+  class="card"
 >
   Status laden...
 </div>
+
+<div class="card">
 
 <h3>
   Log
 </h3>
 
-<pre id="logs">
+<pre
+  id="logs"
+>
 Wachten...
 </pre>
+
+</div>
 
 <script>
 
 const shop =
   ${JSON.stringify(shop)};
 
-const button =
+const test =
+  document.getElementById(
+    "test"
+  );
+
+const start =
   document.getElementById(
     "start"
   );
@@ -2204,11 +3175,13 @@ async function refresh(){
       (
         data.current
           ? (
-              "<br><br><strong>Huidig:</strong> " +
-              data.current.index +
-              " — " +
-              data.current.title
-            )
+            "<br><br><strong>Huidig:</strong> " +
+            data.current.index +
+            "/" +
+            data.current.total +
+            " — " +
+            data.current.title
+          )
           : ""
       );
 
@@ -2216,27 +3189,100 @@ async function refresh(){
       "logs"
     ).textContent =
       (
-        data.logs || []
+        data.logs ||
+        []
       ).join(
         "\\n"
       );
 
-    button.disabled =
+    test.disabled =
       data.running;
 
-  } catch(error){
+    start.disabled =
+      data.running;
+
+  }catch(error){
 
     console.error(
       error
     );
 
   }
+
 }
 
-button.onclick =
-  async function(){
+test.onclick =
+  async () => {
 
-    button.disabled =
+    if(
+      !confirm(
+        "Eén product wordt vertaald en opgeslagen. Doorgaan?"
+      )
+    ){
+      return;
+    }
+
+    test.disabled =
+      true;
+
+    const response =
+      await fetch(
+        "/translate-one",
+        {
+          method:
+            "POST",
+
+          headers:{
+            "Content-Type":
+              "application/json"
+          },
+
+          body:
+            JSON.stringify({
+              shop
+            })
+        }
+      );
+
+    const data =
+      await response.json();
+
+    if(
+      !response.ok
+    ){
+
+      alert(
+        data.error ||
+        "Test mislukt."
+      );
+
+      test.disabled =
+        false;
+
+      return;
+    }
+
+    alert(
+      "Testproduct verwerkt: " +
+      data.newTitle
+    );
+
+    refresh();
+
+  };
+
+start.onclick =
+  async () => {
+
+    if(
+      !confirm(
+        "Dit start alle nog niet verwerkte producten. Doorgaan?"
+      )
+    ){
+      return;
+    }
+
+    start.disabled =
       true;
 
     const response =
@@ -2246,15 +3292,15 @@ button.onclick =
           method:
             "POST",
 
-          headers: {
+          headers:{
             "Content-Type":
-              "application/json",
+              "application/json"
           },
 
           body:
             JSON.stringify({
-              shop,
-            }),
+              shop
+            })
         }
       );
 
@@ -2270,17 +3316,18 @@ button.onclick =
         "Starten mislukt."
       );
 
-      button.disabled =
+      start.disabled =
         false;
 
       return;
     }
 
     alert(
-      "De vertaaljob is gestart."
+      "De volledige vertaaljob is gestart."
     );
 
     refresh();
+
   };
 
 refresh();
@@ -2295,36 +3342,44 @@ setInterval(
 </body>
 
 </html>
-    `);
+      `
+    );
   }
 );
 
+/* =========================================================
+   TEST ONE PRODUCT
+========================================================= */
+
 app.post(
-  "/translate-all",
-  (req, res) => {
+  "/translate-one",
+  async (
+    req,
+    res
+  ) => {
     const shop =
       req.body?.shop;
 
     if (
-      !isValidShop(shop)
+      !validShop(shop)
     ) {
       return res
         .status(400)
         .json({
           error:
-            "Ongeldige shop.",
+            "Ongeldige shop."
         });
     }
 
     if (
-      sessionShop(req) !==
+      getSessionShop(req) !==
       shop
     ) {
       return res
         .status(403)
         .json({
           error:
-            "Geen geldige Shopify-sessie.",
+            "Geen geldige sessie."
         });
     }
 
@@ -2335,12 +3390,83 @@ app.post(
         .status(409)
         .json({
           error:
-            "Er draait al een vertaaljob.",
+            "Er draait al een job."
+        });
+    }
+
+    try {
+      const translated =
+        await runTestOne(
+          shop
+        );
+
+      res.json({
+        ok:
+          true,
+
+        newTitle:
+          translated.title
+      });
+    } catch (error) {
+      res
+        .status(500)
+        .json({
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+/* =========================================================
+   START ALL PRODUCTS
+========================================================= */
+
+app.post(
+  "/translate-all",
+  (
+    req,
+    res
+  ) => {
+    const shop =
+      req.body?.shop;
+
+    if (
+      !validShop(shop)
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Ongeldige shop."
         });
     }
 
     if (
-      !shopTokens.has(
+      getSessionShop(req) !==
+      shop
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "Geen geldige sessie."
+        });
+    }
+
+    if (
+      job.running
+    ) {
+      return res
+        .status(409)
+        .json({
+          error:
+            "Er draait al een job."
+        });
+    }
+
+    if (
+      !tokens.has(
         shop
       )
     ) {
@@ -2348,7 +3474,7 @@ app.post(
         .status(401)
         .json({
           error:
-            "Shopify-token ontbreekt.",
+            "Shopify-token ontbreekt."
         });
     }
 
@@ -2359,11 +3485,11 @@ app.post(
         .status(500)
         .json({
           error:
-            "OPENAI_API_KEY ontbreekt in Render.",
+            "OPENAI_API_KEY ontbreekt."
         });
     }
 
-    runTranslationJob(
+    runFullJob(
       shop
     ).catch(
       (error) => {
@@ -2376,32 +3502,43 @@ app.post(
     res
       .status(202)
       .json({
-        ok: true,
+        ok:
+          true
       });
   }
 );
 
+/* =========================================================
+   JOB STATUS
+========================================================= */
+
 app.get(
   "/translate-status",
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
     const shop =
       req.query.shop;
 
     if (
-      sessionShop(req) !==
+      getSessionShop(req) !==
       shop
     ) {
       return res
         .status(403)
         .json({
           error:
-            "Geen geldige sessie.",
+            "Geen geldige sessie."
         });
     }
 
     res.json({
       running:
         job.running,
+
+      mode:
+        job.mode,
 
       shop:
         job.shop,
@@ -2438,10 +3575,14 @@ app.get(
       logs:
         job.logs.slice(
           -100
-        ),
+        )
     });
   }
 );
+
+/* =========================================================
+   SERVER
+========================================================= */
 
 if (
   typeof fetch !==
@@ -2452,75 +3593,7 @@ if (
   );
 }
 
-app.get(
-  "/bf-diagnose",
-  async (req, res) => {
-    const shop = req.query.shop;
-
-    if (!validShop(shop)) {
-      return res.status(400).json({
-        error: "Ongeldige shop."
-      });
-    }
-
-    const connection = shopTokens.get(shop);
-
-    if (!connection) {
-      return res.status(401).json({
-        error: "Shopify is niet verbonden."
-      });
-    }
-
-    const query = `
-      query BFSizeChart {
-        shop {
-          metafield(
-            namespace: "sizechartsrelentless"
-            key: "size_charts"
-          ) {
-            id
-            namespace
-            key
-            type
-            value
-            compareDigest
-          }
-        }
-      }
-    `;
-
-    try {
-      const data = await shopifyGraphQL(
-        shop,
-        connection.accessToken,
-        query
-      );
-
-      if (!data.shop.metafield) {
-        return res.status(404).json({
-          found: false,
-          message:
-            "BF-metafield sizechartsrelentless.size_charts niet gevonden."
-        });
-      }
-
-      res.json({
-        found: true,
-        id: data.shop.metafield.id,
-        namespace: data.shop.metafield.namespace,
-        key: data.shop.metafield.key,
-        type: data.shop.metafield.type,
-        compareDigest:
-          data.shop.metafield.compareDigest,
-        value: data.shop.metafield.value
-      });
-    } catch (error) {
-      res.status(500).json({
-        error: error.message
-      });
-    }
-  }
-);app.listen(
+app.listen(
   PORT,
   () => {
     console.log(
