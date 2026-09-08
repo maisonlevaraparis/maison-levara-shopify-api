@@ -6,107 +6,261 @@ const path = require("path");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
-const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
-const REDIRECT_URI = process.env.REDIRECT_URI;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
 const SHOPIFY_API_VERSION = "2026-07";
-const SCOPES = "write_products";
+
+const SHOPIFY_CLIENT_ID =
+  process.env.SHOPIFY_CLIENT_ID;
+
+const SHOPIFY_CLIENT_SECRET =
+  process.env.SHOPIFY_CLIENT_SECRET;
+
+const REDIRECT_URI =
+  process.env.REDIRECT_URI;
+
+const OPENAI_API_KEY =
+  process.env.OPENAI_API_KEY;
+
+const OPENAI_MODEL =
+  process.env.OPENAI_MODEL ||
+  "gpt-5-mini";
+
+const SHOPIFY_SCOPES =
+  "write_products,write_files";
+
 const TOKEN_FILE =
   process.env.TOKEN_FILE ||
-  path.join("/tmp", "maison-levara-tokens.json");
+  path.join(
+    "/tmp",
+    "maison-levara-shopify-tokens.json"
+  );
 
-const oauthStates = new Map();
-const sessions = new Map();
+const oauthStates =
+  new Map();
 
-let tokens = loadTokens();
+const sessions =
+  new Map();
+
+const tokens =
+  loadTokens();
 
 const job = {
   running: false,
   mode: null,
   shop: null,
+
   total: 0,
   pending: 0,
   processed: 0,
   skipped: 0,
   failed: 0,
+
   current: null,
+
   startedAt: null,
   finishedAt: null,
+
   logs: [],
-  errors: []
+  errors: [],
 };
 
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true }));
+app.use(
+  express.json({
+    limit: "12mb",
+  })
+);
+
+app.use(
+  express.urlencoded({
+    extended: true,
+  })
+);
+
+/* =========================================================
+   BASIC HELPERS
+========================================================= */
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise(
+    (resolve) =>
+      setTimeout(resolve, ms)
+  );
 }
 
 function validShop(shop) {
   return (
     typeof shop === "string" &&
-    /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/.test(shop)
+    /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i.test(
+      shop
+    )
   );
 }
 
 function normalize(value) {
-  return String(value || "")
+  return String(
+    value || ""
+  )
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
+    .replace(
+      /[\u0300-\u036f]/g,
+      ""
+    )
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
+    .replace(
+      /[^a-z0-9]+/g,
+      " "
+    )
     .trim();
 }
 
 function log(message) {
-  const line = `[${new Date().toISOString()}] ${message}`;
+  const line =
+    `[${new Date().toISOString()}] ${message}`;
 
   job.logs.push(line);
 
-  if (job.logs.length > 300) {
+  if (
+    job.logs.length >
+    500
+  ) {
     job.logs.shift();
   }
 
   console.log(line);
 }
 
+/* =========================================================
+   TOKEN STORAGE
+========================================================= */
+
+function loadTokens() {
+  try {
+    if (
+      !fs.existsSync(
+        TOKEN_FILE
+      )
+    ) {
+      return new Map();
+    }
+
+    const parsed =
+      JSON.parse(
+        fs.readFileSync(
+          TOKEN_FILE,
+          "utf8"
+        )
+      );
+
+    return new Map(
+      Object.entries(parsed)
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+function saveTokens() {
+  try {
+    fs.mkdirSync(
+      path.dirname(
+        TOKEN_FILE
+      ),
+      {
+        recursive: true,
+      }
+    );
+
+    fs.writeFileSync(
+      TOKEN_FILE,
+      JSON.stringify(
+        Object.fromEntries(
+          tokens
+        ),
+        null,
+        2
+      ),
+      {
+        mode: 0o600,
+      }
+    );
+  } catch (error) {
+    log(
+      `Tokenopslag waarschuwing: ${error.message}`
+    );
+  }
+}
+
+/* =========================================================
+   SESSIONS
+========================================================= */
+
 function parseCookies(req) {
-  const out = {};
+  const result = {};
 
   for (
     const part of
-      (req.headers.cookie || "").split(";")
+      (
+        req.headers.cookie ||
+        ""
+      ).split(";")
   ) {
-    const i = part.indexOf("=");
+    const index =
+      part.indexOf("=");
 
-    if (i < 0) {
+    if (
+      index < 0
+    ) {
       continue;
     }
 
-    out[
-      part.slice(0, i).trim()
+    result[
+      part
+        .slice(
+          0,
+          index
+        )
+        .trim()
     ] =
       decodeURIComponent(
-        part.slice(i + 1).trim()
+        part
+          .slice(
+            index + 1
+          )
+          .trim()
       );
   }
 
-  return out;
+  return result;
 }
 
-function setSession(res, shop) {
+function createSession(shop) {
   const id =
-    crypto.randomBytes(32).toString("hex");
+    crypto.randomBytes(
+      32
+    ).toString("hex");
 
-  sessions.set(id, {
-    shop,
-    expiresAt:
-      Date.now() +
-      24 * 60 * 60 * 1000
-  });
+  sessions.set(
+    id,
+    {
+      shop,
+
+      expiresAt:
+        Date.now() +
+        24 *
+          60 *
+          60 *
+          1000,
+    }
+  );
+
+  return id;
+}
+
+function setSessionCookie(
+  res,
+  shop
+) {
+  const id =
+    createSession(shop);
 
   res.setHeader(
     "Set-Cookie",
@@ -118,7 +272,9 @@ function setSession(res, shop) {
 
 function getSessionShop(req) {
   const id =
-    parseCookies(req).ml_session;
+    parseCookies(
+      req
+    ).ml_session;
 
   if (!id) {
     return null;
@@ -142,53 +298,9 @@ function getSessionShop(req) {
   return session.shop;
 }
 
-function loadTokens() {
-  try {
-    if (!fs.existsSync(TOKEN_FILE)) {
-      return new Map();
-    }
-
-    return new Map(
-      Object.entries(
-        JSON.parse(
-          fs.readFileSync(
-            TOKEN_FILE,
-            "utf8"
-          )
-        )
-      )
-    );
-  } catch {
-    return new Map();
-  }
-}
-
-function saveTokens() {
-  try {
-    fs.mkdirSync(
-      path.dirname(TOKEN_FILE),
-      {
-        recursive: true
-      }
-    );
-
-    fs.writeFileSync(
-      TOKEN_FILE,
-      JSON.stringify(
-        Object.fromEntries(tokens),
-        null,
-        2
-      ),
-      {
-        mode: 0o600
-      }
-    );
-  } catch (error) {
-    log(
-      `Token-opslag niet beschikbaar: ${error.message}`
-    );
-  }
-}
+/* =========================================================
+   SHOPIFY HMAC
+========================================================= */
 
 function verifyHmac(query) {
   const {
@@ -198,7 +310,7 @@ function verifyHmac(query) {
 
   if (
     !hmac ||
-    !CLIENT_SECRET
+    !SHOPIFY_CLIENT_SECRET
   ) {
     return false;
   }
@@ -216,16 +328,20 @@ function verifyHmac(query) {
     crypto
       .createHmac(
         "sha256",
-        CLIENT_SECRET
+        SHOPIFY_CLIENT_SECRET
       )
       .update(message)
       .digest("hex");
 
   try {
     return crypto.timingSafeEqual(
-      Buffer.from(digest),
       Buffer.from(
-        String(hmac)
+        digest,
+        "utf8"
+      ),
+      Buffer.from(
+        String(hmac),
+        "utf8"
       )
     );
   } catch {
@@ -239,11 +355,12 @@ function verifyHmac(query) {
 
 async function shopifyGraphQL(
   shop,
-  token,
+  accessToken,
   query,
   variables = {}
 ) {
-  let lastError = null;
+  let lastError =
+    null;
 
   for (
     let attempt = 0;
@@ -255,21 +372,22 @@ async function shopifyGraphQL(
         await fetch(
           `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
           {
-            method: "POST",
+            method:
+              "POST",
 
             headers: {
               "Content-Type":
                 "application/json",
 
               "X-Shopify-Access-Token":
-                token
+                accessToken,
             },
 
             body:
               JSON.stringify({
                 query,
-                variables
-              })
+                variables,
+              }),
           }
         );
 
@@ -282,7 +400,7 @@ async function shopifyGraphQL(
       ) {
         lastError =
           new Error(
-            "Shopify rate limit"
+            "Shopify rate limit."
           );
 
         await sleep(
@@ -296,7 +414,9 @@ async function shopifyGraphQL(
         continue;
       }
 
-      if (!response.ok) {
+      if (
+        !response.ok
+      ) {
         throw new Error(
           `Shopify HTTP ${response.status}: ${JSON.stringify(
             body
@@ -310,8 +430,8 @@ async function shopifyGraphQL(
         const message =
           body.errors
             .map(
-              (x) =>
-                x.message
+              (error) =>
+                error.message
             )
             .join(" | ");
 
@@ -342,8 +462,11 @@ async function shopifyGraphQL(
       }
 
       return body.data;
-    } catch (error) {
-      lastError = error;
+    } catch (
+      error
+    ) {
+      lastError =
+        error;
 
       if (
         attempt === 5
@@ -364,20 +487,25 @@ async function shopifyGraphQL(
   throw (
     lastError ||
     new Error(
-      "Shopify API request failed"
+      "Shopify API request failed."
     )
   );
 }
 
 /* =========================================================
-   PRODUCT DATA
+   PRODUCT QUERY
 ========================================================= */
 
 const PRODUCTS_QUERY = `
-  query Products($after: String) {
-    products(first: 100, after: $after) {
+  query GetProducts($after: String) {
+    products(
+      first: 100
+      after: $after
+    ) {
       nodes {
         id
+        legacyResourceId
+
         title
         handle
         productType
@@ -393,6 +521,11 @@ const PRODUCTS_QUERY = `
           name
           position
 
+          linkedMetafield {
+            namespace
+            key
+          }
+
           optionValues {
             id
             name
@@ -401,7 +534,9 @@ const PRODUCTS_QUERY = `
           }
         }
 
-        media(first: 100) {
+        media(
+          first: 250
+        ) {
           nodes {
             id
             alt
@@ -409,7 +544,9 @@ const PRODUCTS_QUERY = `
           }
         }
 
-        metafields(first: 100) {
+        metafields(
+          first: 100
+        ) {
           nodes {
             id
             namespace
@@ -430,20 +567,22 @@ const PRODUCTS_QUERY = `
 
 async function getAllProducts(
   shop,
-  token
+  accessToken
 ) {
   const products = [];
 
   let after = null;
 
-  while (true) {
+  while (
+    true
+  ) {
     const data =
       await shopifyGraphQL(
         shop,
-        token,
+        accessToken,
         PRODUCTS_QUERY,
         {
-          after
+          after,
         }
       );
 
@@ -469,29 +608,37 @@ async function getAllProducts(
 }
 
 /* =========================================================
-   BF SIZE CHART
-   READ-ONLY DIAGNOSTIC
+   DONE MARKER
 ========================================================= */
 
-async function getShopBFMetafield(
-  shop,
-  token
-) {
-  const query = `
-    query BFSizeChart {
-      shop {
-        id
+function isDone(product) {
+  return product.metafields.nodes.some(
+    (field) =>
+      field.namespace ===
+        "maison_levara" &&
+      field.key ===
+        "fr_translation_v1" &&
+      field.value ===
+        "done"
+  );
+}
 
-        metafield(
-          namespace: "sizechartsrelentless"
-          key: "size_charts"
-        ) {
-          id
-          namespace
-          key
-          type
-          value
-          compareDigest
+async function markDone(
+  shop,
+  token,
+  productId
+) {
+  const mutation = `
+    mutation MarkProductDone(
+      $metafields: [MetafieldsSetInput!]!
+    ) {
+      metafieldsSet(
+        metafields: $metafields
+      ) {
+        userErrors {
+          field
+          message
+          code
         }
       }
     }
@@ -501,10 +648,45 @@ async function getShopBFMetafield(
     await shopifyGraphQL(
       shop,
       token,
-      query
+      mutation,
+      {
+        metafields: [
+          {
+            ownerId:
+              productId,
+
+            namespace:
+              "maison_levara",
+
+            key:
+              "fr_translation_v1",
+
+            type:
+              "single_line_text_field",
+
+            value:
+              "done",
+          },
+        ],
+      }
     );
 
-  return data.shop;
+  const errors =
+    data.metafieldsSet
+      .userErrors || [];
+
+  if (
+    errors.length
+  ) {
+    throw new Error(
+      errors
+        .map(
+          (error) =>
+            error.message
+        )
+        .join(" | ")
+    );
+  }
 }
 
 /* =========================================================
@@ -515,20 +697,45 @@ function protectHtml(
   html
 ) {
   const tags = [];
-  const attrs = [];
+  const attributes = [];
+  const rawBlocks = [];
 
   let source =
-    String(html || "");
+    String(
+      html || ""
+    );
+
+  source =
+    source.replace(
+      /<(script|style)\b[\s\S]*?<\/\1>/gi,
+      (block) => {
+        const token =
+          `___ML_RAW_${String(
+            rawBlocks.length
+          ).padStart(
+            5,
+            "0"
+          )}___`;
+
+        rawBlocks.push({
+          token,
+          block,
+        });
+
+        return token;
+      }
+    );
 
   source =
     source.replace(
       /<[^>]*>/g,
       (tag) => {
-        let safeTag = tag;
+        let protectedTag =
+          tag;
 
-        safeTag =
-          safeTag.replace(
-            /\b(alt|title)\s*=\s*(["'])([\s\S]*?)\2/gi,
+        protectedTag =
+          protectedTag.replace(
+            /\b(alt|title|href|src)\s*=\s*(["'])([\s\S]*?)\2/gi,
             (
               full,
               name,
@@ -536,7 +743,7 @@ function protectHtml(
               value
             ) => {
               const id =
-                attrs.length;
+                attributes.length;
 
               const token =
                 `___ML_ATTR_${String(
@@ -546,11 +753,17 @@ function protectHtml(
                   "0"
                 )}___`;
 
-              attrs.push({
+              attributes.push({
                 id,
                 name:
                   name.toLowerCase(),
-                value
+
+                value,
+
+                translatable:
+                  /^(alt|title)$/i.test(
+                    name
+                  ),
               });
 
               return `${name}=${quote}${token}${quote}`;
@@ -568,7 +781,7 @@ function protectHtml(
         tags.push({
           token,
           tag:
-            safeTag
+            protectedTag,
         });
 
         return token;
@@ -578,94 +791,64 @@ function protectHtml(
   return {
     html:
       source,
+
     tags,
-    attrs
+
+    attributes,
+
+    rawBlocks,
   };
 }
 
 function restoreHtml(
   translated,
   prepared,
-  translatedAttrs
+  translatedAttributes
 ) {
   let html =
     String(
       translated || ""
     );
 
-  const map =
+  const attrMap =
     new Map(
       (
-        translatedAttrs ||
+        translatedAttributes ||
         []
       ).map(
-        (x) => [
+        (item) => [
           Number(
-            x.id
+            item.id
           ),
           String(
-            x.value || ""
-          )
+            item.value ||
+              ""
+          ),
         ]
       )
     );
 
-  for (
-    const attr of
-      prepared.attrs
+  function escapeAttribute(
+    value
   ) {
-    let value =
-      map.has(
-        attr.id
-      )
-        ? map.get(
-            attr.id
-          )
-        : attr.value;
-
-    value =
+    return String(
       value
-        .replace(
-          /&/g,
-          "&amp;"
-        )
-        .replace(
-          /"/g,
-          "&quot;"
-        )
-        .replace(
-          /</g,
-          "&lt;"
-        )
-        .replace(
-          />/g,
-          "&gt;"
-        );
-
-    const token =
-      `___ML_ATTR_${String(
-        attr.id
-      ).padStart(
-        5,
-        "0"
-      )}___`;
-
-    if (
-      html.split(
-        token
-      ).length -
-        1 !==
-      1
-    ) {
-      throw new Error(
-        `HTML-attribuut ${token} ontbreekt of is dubbel.`
-      );
-    }
-
-    html =
-      html.replace(
-        token,
-        value
+    )
+      .replace(
+        /&/g,
+        "&amp;"
+      )
+      .replace(
+        /"/g,
+        "&quot;"
+      )
+      .replace(
+        /</g,
+        "&lt;"
+      )
+      .replace(
+        />/g,
+        "&gt;"
       );
   }
 
@@ -685,27 +868,107 @@ function restoreHtml(
       );
     }
 
+    let restoredTag =
+      item.tag;
+
+    for (
+      const attribute of
+        prepared.attributes
+    ) {
+      const token =
+        `___ML_ATTR_${String(
+          attribute.id
+        ).padStart(
+          5,
+          "0"
+        )}___`;
+
+      if (
+        !restoredTag.includes(
+          token
+        )
+      ) {
+        continue;
+      }
+
+      let value =
+        attribute.value;
+
+      if (
+        attribute.translatable &&
+        attrMap.has(
+          attribute.id
+        )
+      ) {
+        value =
+          attrMap.get(
+            attribute.id
+          );
+      }
+
+      restoredTag =
+        restoredTag.replace(
+          token,
+          escapeAttribute(
+            value
+          )
+        );
+    }
+
+    if (
+      /___ML_ATTR_\d{5}___/.test(
+        restoredTag
+      )
+    ) {
+      throw new Error(
+        "HTML-attribuut placeholder ontbreekt."
+      );
+    }
+
     html =
       html.replace(
         item.token,
-        item.tag
+        restoredTag
+      );
+  }
+
+  for (
+    const raw of
+      prepared.rawBlocks
+  ) {
+    if (
+      html.split(
+        raw.token
+      ).length -
+        1 !==
+      1
+    ) {
+      throw new Error(
+        "Beschermd HTML-blok ontbreekt."
+      );
+    }
+
+    html =
+      html.replace(
+        raw.token,
+        raw.block
       );
   }
 
   if (
-    /___ML_(TAG|ATTR)_\d{5}___/.test(
+    /___ML_(TAG|ATTR|RAW)_\d{5}___/.test(
       html
     )
   ) {
     throw new Error(
-      "Onopgeloste HTML-placeholder gevonden."
+      "Onopgeloste HTML placeholder gevonden."
     );
   }
 
   return html;
 }
 
-function htmlTags(
+function htmlTagList(
   html
 ) {
   return [
@@ -713,14 +976,14 @@ function htmlTags(
       html || ""
     ).matchAll(
       /<\s*(\/?)\s*([a-zA-Z0-9]+)/g
-    )
+    ),
   ].map(
-    (m) =>
-      `${m[1] ? "/" : ""}${m[2].toLowerCase()}`
+    (match) =>
+      `${match[1] ? "/" : ""}${match[2].toLowerCase()}`
   );
 }
 
-function htmlUrls(
+function htmlUrlList(
   html
 ) {
   return [
@@ -728,70 +991,76 @@ function htmlUrls(
       html || ""
     ).matchAll(
       /\b(?:href|src)\s*=\s*["']([^"']+)["']/gi
-    )
+    ),
   ]
     .map(
-      (m) =>
-        m[1]
+      (match) =>
+        match[1]
     )
     .sort();
-}
-
-function sameArray(
-  a,
-  b
-) {
-  return (
-    a.length ===
-      b.length &&
-    a.every(
-      (
-        value,
-        index
-      ) =>
-        value ===
-        b[index]
-    )
-  );
 }
 
 function assertHtmlSafe(
   before,
   after
 ) {
+  const beforeTags =
+    htmlTagList(
+      before
+    );
+
+  const afterTags =
+    htmlTagList(
+      after
+    );
+
   if (
-    !sameArray(
-      htmlTags(
-        before
-      ),
-      htmlTags(
-        after
-      )
+    beforeTags.length !==
+      afterTags.length ||
+    beforeTags.some(
+      (
+        value,
+        index
+      ) =>
+        value !==
+        afterTags[index]
     )
   ) {
     throw new Error(
-      "HTML-structuur is gewijzigd."
+      "HTML-tagstructuur is gewijzigd."
     );
   }
 
+  const beforeUrls =
+    htmlUrlList(
+      before
+    );
+
+  const afterUrls =
+    htmlUrlList(
+      after
+    );
+
   if (
-    !sameArray(
-      htmlUrls(
-        before
-      ),
-      htmlUrls(
-        after
-      )
+    beforeUrls.length !==
+      afterUrls.length ||
+    beforeUrls.some(
+      (
+        value,
+        index
+      ) =>
+        value !==
+        afterUrls[index]
     )
   ) {
     throw new Error(
-      "Een href/src URL is gewijzigd."
+      "Een product-URL in de HTML is gewijzigd."
     );
   }
 }
 
 /* =========================================================
-   FRENCH PRODUCT NAMING
+   FRENCH NAMES
 ========================================================= */
 
 const FRENCH_NAMES = [
@@ -801,12 +1070,6 @@ const FRENCH_NAMES = [
   "Alix",
   "Amélie",
   "Anaïs",
-  "Angèle",
-  "Angélique",
-  "Anna",
-  "Annabelle",
-  "Anne",
-  "Antoinette",
   "Apolline",
   "Ariane",
   "Aurélie",
@@ -829,11 +1092,9 @@ const FRENCH_NAMES = [
   "Clémence",
   "Colette",
   "Coralie",
-  "Corinne",
   "Daphné",
   "Delphine",
   "Diane",
-  "Élodie",
   "Élise",
   "Émilie",
   "Emma",
@@ -875,7 +1136,6 @@ const FRENCH_NAMES = [
   "Mélissa",
   "Mélodie",
   "Mireille",
-  "Monique",
   "Nathalie",
   "Noémie",
   "Océane",
@@ -904,193 +1164,178 @@ const FRENCH_NAMES = [
   "Victoire",
   "Virginie",
   "Yasmine",
-  "Zoé"
+  "Zoé",
 ];
 
-const FRENCH_KEYS =
+const FRENCH_NAME_KEYS =
   new Set(
     FRENCH_NAMES.map(
       normalize
     )
   );
 
-function fallbackName(
-  index,
-  used
-) {
-  for (
-    let i = 0;
-    i <
-    FRENCH_NAMES.length;
-    i++
-  ) {
-    const name =
-      FRENCH_NAMES[
-        (index + i) %
-          FRENCH_NAMES.length
-      ];
-
-    const prefix =
-      normalize(name) +
-      " |";
-
-    const alreadyUsed =
-      [...used].some(
-        (title) =>
-          normalize(
-            title
-          ).startsWith(
-            prefix
-          )
-      );
-
-    if (
-      !alreadyUsed
-    ) {
-      return name;
-    }
-  }
-
-  return FRENCH_NAMES[
-    index %
-      FRENCH_NAMES.length
-  ];
-}
-
 /* =========================================================
    OPENAI
 ========================================================= */
 
-const AI_SCHEMA = {
-  type: "object",
+const PRODUCT_SCHEMA = {
+  type:
+    "object",
 
-  additionalProperties: false,
+  additionalProperties:
+    false,
 
   properties: {
     firstName: {
-      type: "string"
+      type:
+        "string",
     },
 
     descriptor: {
-      type: "string"
+      type:
+        "string",
     },
 
     productType: {
-      type: "string"
+      type:
+        "string",
     },
 
     descriptionHtml: {
-      type: "string"
+      type:
+        "string",
     },
 
     seoTitle: {
-      type: "string"
+      type:
+        "string",
     },
 
     seoDescription: {
-      type: "string"
+      type:
+        "string",
     },
 
     htmlAttributes: {
-      type: "array",
+      type:
+        "array",
 
       items: {
-        type: "object",
+        type:
+          "object",
 
-        additionalProperties: false,
+        additionalProperties:
+          false,
 
         properties: {
           id: {
-            type: "integer"
+            type:
+              "integer",
           },
 
           value: {
-            type: "string"
-          }
+            type:
+              "string",
+          },
         },
 
         required: [
           "id",
-          "value"
-        ]
-      }
+          "value",
+        ],
+      },
     },
 
     options: {
-      type: "array",
+      type:
+        "array",
 
       items: {
-        type: "object",
+        type:
+          "object",
 
-        additionalProperties: false,
+        additionalProperties:
+          false,
 
         properties: {
           index: {
-            type: "integer"
+            type:
+              "integer",
           },
 
           name: {
-            type: "string"
+            type:
+              "string",
           },
 
           values: {
-            type: "array",
+            type:
+              "array",
 
             items: {
-              type: "object",
+              type:
+                "object",
 
-              additionalProperties: false,
+              additionalProperties:
+                false,
 
               properties: {
                 id: {
-                  type: "string"
+                  type:
+                    "string",
                 },
 
                 name: {
-                  type: "string"
-                }
+                  type:
+                    "string",
+                },
               },
 
               required: [
                 "id",
-                "name"
-              ]
-            }
-          }
+                "name",
+              ],
+            },
+          },
         },
 
         required: [
           "index",
           "name",
-          "values"
-        ]
-      }
+          "values",
+        ],
+      },
     },
 
     media: {
-      type: "array",
+      type:
+        "array",
 
       items: {
-        type: "object",
+        type:
+          "object",
 
-        additionalProperties: false,
+        additionalProperties:
+          false,
 
         properties: {
           id: {
-            type: "string"
+            type:
+              "string",
           },
 
           alt: {
-            type: "string"
-          }
+            type:
+              "string",
+          },
         },
 
         required: [
           "id",
-          "alt"
-        ]
-      }
-    }
+          "alt",
+        ],
+      },
+    },
   },
 
   required: [
@@ -1102,96 +1347,167 @@ const AI_SCHEMA = {
     "seoDescription",
     "htmlAttributes",
     "options",
-    "media"
-  ]
+    "media",
+  ],
 };
 
-const SYSTEM_PROMPT = `
-Je bent de vaste Franse productcopywriter van Maison Lévara Paris.
+const BF_SCHEMA = {
+  type:
+    "object",
 
-Vertaal alle klantzichtbare productinhoud naar natuurlijk, professioneel Frans.
+  additionalProperties:
+    false,
+
+  properties: {
+    translations: {
+      type:
+        "array",
+
+      items: {
+        type:
+          "object",
+
+        additionalProperties:
+          false,
+
+        properties: {
+          id: {
+            type:
+              "integer",
+          },
+
+          text: {
+            type:
+              "string",
+          },
+        },
+
+        required: [
+          "id",
+          "text",
+        ],
+      },
+    },
+  },
+
+  required: [
+    "translations",
+  ],
+};
+
+const PRODUCT_PROMPT = `
+Je bent de vaste Franse e-commerce copywriter van Maison Lévara Paris.
+
+Vertaal de volledige aangeleverde productdata naar natuurlijk,
+professioneel Frans voor een moderne Franse modewebshop.
 
 PRODUCTNAAM:
 Gebruik exact:
 "Franse voornaam | Franse productomschrijving"
 
-Gebruik alleen een echte Franse voornaam.
+De eerste helft moet een echte Franse voornaam zijn.
+De tweede helft moet een korte, duidelijke Franse omschrijving
+van het product zijn.
 
-De descriptor moet:
-- kort zijn
-- natuurlijk Frans zijn
-- duidelijk maken wat het product is
-- passen bij een moderne Franse fashionstore
+Gebruik nooit een Nederlandse, Italiaanse, Spaanse of Engelse
+voornaam.
 
-De volledige producttitel moet uniek zijn binnen de volledige catalogus.
+De volledige titel moet uniek zijn ten opzichte van existingTitles.
 
-Gebruik geen Nederlandse, Italiaanse, Engelse of Spaanse productnaam.
+De stijl moet aansluiten op de oude Luno Milano-naamstructuur:
+Voornaam | productomschrijving.
 
 BESCHRIJVING:
-Vertaal alle zichtbare tekst naar Frans.
-
-Dit omvat:
-- normale producttekst
-- tabellen
-- maattabellen
-- tabelkoppen
-- maatinformatie
-- kleurinformatie
+Vertaal alle klantzichtbare tekst.
+Vertaal ook maattabellen, tabellen en teksten in tabellen.
 
 HTML:
-De aangeleverde HTML-placeholders moeten exact blijven bestaan.
+Behoud alle HTML-placeholders exact.
+Voeg geen HTML-tags toe.
+Verwijder geen HTML-tags.
+Verander nooit href, src of URL's.
+Verander nooit class, id of data-* attributen.
 
-Wijzig nooit:
-- href
-- src
-- URLs
-- classes
-- ids
-- data-attributen
+Vertaal normale alt/title-attributen via htmlAttributes.
+
+Behoud:
 - cijfers
 - percentages
+- maten
 - afmetingen
 - eenheden
 - SKU's
+- barcodes
 - productcodes
 - technische codes
 
-Voeg geen HTML-tags toe.
-Verwijder geen HTML-tags.
-
-ALT EN TITLE:
-Vertaal normale klantzichtbare alt- en title-tekst naar Frans.
-
-OPTIES:
-Size -> Taille
-Color -> Couleur
-Colour -> Couleur
-Material -> Matière
-
-Vertaal normale kleurwaarden naar natuurlijk Frans.
-
-Laat:
-XS
-S
-M
-L
-XL
-XXL
-en numerieke maten intact.
-
 One Size -> Taille unique.
 
+OPTIES:
+Size / Taglia -> Taille
+Color / Colore / Kleur / Colour -> Couleur
+Material -> Matière
+
+Vertaal normale kleurwaarden naar Frans.
+
+Laat XS, S, M, L, XL, XXL en numerieke maatcodes intact.
+
 PRODUCTTYPE:
-Vertaal het producttype naar Frans.
+Vertaal naar Frans wanneer aanwezig.
 
 SEO:
 Vertaal SEO title en SEO description naar natuurlijk Frans.
-Geen keyword stuffing.
+Gebruik geen keyword stuffing.
 
 MEDIA:
-Vertaal alt-teksten.
+Vertaal alleen de alt-teksten.
 
-Geef uitsluitend JSON conform het schema terug.
+WIJZIG NOOIT:
+- prijzen
+- voorraad
+- SKU
+- barcode
+- handle
+- product-ID
+- variant-ID
+- afbeeldingen
+
+Gebruik geen nieuwe producteigenschappen die niet in de bron staan.
+
+Geef alleen het gevraagde JSON-object terug.
+`;
+
+const BF_PROMPT = `
+Vertaal de tekst van een BF Size Chart naar natuurlijk Frans.
+
+Vertaal:
+- buttonText
+- titels
+- beschrijvingen
+- kolomteksten
+- meetnamen
+- kleurwoorden
+- woorden in tabelcellen
+
+Taglia -> Taille
+Size -> Taille
+Colore -> Couleur
+Color -> Couleur
+Kleur -> Couleur
+One Size -> Taille unique
+
+Behoud exact:
+- cijfers
+- maataanduidingen
+- afmetingen
+- eenheden
+- percentages
+- technische codes
+- HTML-tags en placeholders
+
+Verander nooit getallen of maten.
+
+Geef alleen het gevraagde JSON-object terug.
 `;
 
 function extractOutputText(
@@ -1233,13 +1549,15 @@ function extractOutputText(
 }
 
 async function openAIJson(
+  systemPrompt,
+  schema,
   payload
 ) {
   if (
     !OPENAI_API_KEY
   ) {
     throw new Error(
-      "OPENAI_API_KEY ontbreekt in Render."
+      "OPENAI_API_KEY ontbreekt."
     );
   }
 
@@ -1255,7 +1573,7 @@ async function openAIJson(
       const controller =
         new AbortController();
 
-      const timer =
+      const timeout =
         setTimeout(
           () =>
             controller.abort(),
@@ -1269,7 +1587,8 @@ async function openAIJson(
           await fetch(
             "https://api.openai.com/v1/responses",
             {
-              method: "POST",
+              method:
+                "POST",
 
               signal:
                 controller.signal,
@@ -1279,7 +1598,7 @@ async function openAIJson(
                   "application/json",
 
                 Authorization:
-                  `Bearer ${OPENAI_API_KEY}`
+                  `Bearer ${OPENAI_API_KEY}`,
               },
 
               body:
@@ -1301,9 +1620,9 @@ async function openAIJson(
                             "input_text",
 
                           text:
-                            SYSTEM_PROMPT
-                        }
-                      ]
+                            systemPrompt,
+                        },
+                      ],
                     },
 
                     {
@@ -1318,11 +1637,14 @@ async function openAIJson(
                           text:
                             JSON.stringify(
                               payload
-                            )
-                        }
-                      ]
-                    }
+                            ),
+                        },
+                      ],
+                    },
                   ],
+
+                  max_output_tokens:
+                    12000,
 
                   text: {
                     format: {
@@ -1330,21 +1652,20 @@ async function openAIJson(
                         "json_schema",
 
                       name:
-                        "maison_levara_product_translation",
+                        "maison_levara_translation",
 
                       strict:
                         true,
 
-                      schema:
-                        AI_SCHEMA
-                    }
-                  }
-                })
+                      schema,
+                    },
+                  },
+                }),
             }
           );
       } finally {
         clearTimeout(
-          timer
+          timeout
         );
       }
 
@@ -1357,7 +1678,7 @@ async function openAIJson(
       ) {
         lastError =
           new Error(
-            "OpenAI rate limit"
+            "OpenAI rate limit."
           );
 
         await sleep(
@@ -1386,7 +1707,9 @@ async function openAIJson(
           body
         );
 
-      if (!text) {
+      if (
+        !text
+      ) {
         throw new Error(
           "OpenAI gaf geen output terug."
         );
@@ -1395,7 +1718,9 @@ async function openAIJson(
       return JSON.parse(
         text
       );
-    } catch (error) {
+    } catch (
+      error
+    ) {
       lastError =
         error;
 
@@ -1423,10 +1748,13 @@ async function openAIJson(
   );
 }
 
-async function translateProduct(
+/* =========================================================
+   PRODUCT TRANSLATION
+========================================================= */
+
+function buildProductPayload(
   product,
-  reservedTitles,
-  index
+  reservedTitles
 ) {
   const prepared =
     protectHtml(
@@ -1434,7 +1762,7 @@ async function translateProduct(
         ""
     );
 
-  const payload = {
+  return {
     currentTitle:
       product.title,
 
@@ -1446,22 +1774,25 @@ async function translateProduct(
       prepared.html,
 
     htmlAttributes:
-      prepared.attrs,
+      prepared.attributes,
 
-    seo:
-      product.seo || {
-        title: "",
-        description: ""
-      },
+    seo: {
+      title:
+        product.seo?.title ||
+        "",
+
+      description:
+        product.seo?.description ||
+        "",
+    },
 
     options:
       product.options.map(
         (
           option,
-          optionIndex
+          index
         ) => ({
-          index:
-            optionIndex,
+          index,
 
           id:
             option.id,
@@ -1476,47 +1807,176 @@ async function translateProduct(
                   value.id,
 
                 name:
-                  value.name
+                  value.name,
               })
-            )
+            ),
         })
       ),
 
     media:
       product.media.nodes.map(
-        (item) => ({
+        (media) => ({
           id:
-            item.id,
+            media.id,
 
           alt:
-            item.alt ||
-            ""
+            media.alt ||
+            "",
         })
       ),
 
     existingTitles:
       [
-        ...reservedTitles
-      ].slice(
-        0,
-        200
-      )
+        ...reservedTitles,
+      ],
   };
+}
+
+function uniqueFallbackTitle(
+  descriptor,
+  reservedTitles,
+  start
+) {
+  for (
+    let offset = 0;
+    offset <
+      FRENCH_NAMES.length;
+    offset++
+  ) {
+    const name =
+      FRENCH_NAMES[
+        (
+          start +
+          offset
+        ) %
+          FRENCH_NAMES.length
+      ];
+
+    const title =
+      `${name} | ${descriptor}`;
+
+    if (
+      !reservedTitles.has(
+        normalize(title)
+      )
+    ) {
+      return title;
+    }
+  }
+
+  throw new Error(
+    "Geen unieke Franse productnaam gevonden."
+  );
+}
+
+function optionValuesUnique(
+  product,
+  result
+) {
+  for (
+    const option of
+      product.options
+  ) {
+    const translated =
+      result.options.find(
+        (item) =>
+          Number(
+            item.index
+          ) ===
+          Number(
+            option.position -
+              1
+          )
+      );
+
+    if (
+      !translated
+    ) {
+      continue;
+    }
+
+    const seen =
+      new Set();
+
+    for (
+      const original of
+        option.optionValues
+    ) {
+      const match =
+        (
+          translated.values ||
+          []
+        ).find(
+          (value) =>
+            String(
+              value.id
+            ) ===
+            String(
+              original.id
+            )
+        );
+
+      const finalValue =
+        String(
+          match?.name ??
+            original.name
+        ).trim();
+
+      const key =
+        normalize(
+          finalValue
+        );
+
+      if (
+        !key
+      ) {
+        continue;
+      }
+
+      if (
+        seen.has(key)
+      ) {
+        return false;
+      }
+
+      seen.add(key);
+    }
+  }
+
+  return true;
+}
+
+async function translateProduct(
+  product,
+  reservedTitles,
+  index
+) {
+  const prepared =
+    protectHtml(
+      product.descriptionHtml ||
+        ""
+    );
+
+  const payload =
+    buildProductPayload(
+      product,
+      reservedTitles
+    );
 
   for (
     let attempt = 0;
     attempt < 6;
     attempt++
   ) {
-    if (
+    payload.retryInstruction =
       attempt
-    ) {
-      payload.retry =
-        `De vorige titel "${payload.previousTitle}" was al bezet. Kies beslist een andere Franse productnaam.`;
-    }
+        ? `La précédente proposition de titre "${payload.previousTitle}" ou les valeurs d'options n'étaient pas valides. Choisis une autre combinaison et garde toutes les valeurs d'une même option uniques.`
+        : "";
 
     const result =
       await openAIJson(
+        PRODUCT_PROMPT,
+        PRODUCT_SCHEMA,
         payload
       );
 
@@ -1527,18 +1987,20 @@ async function translateProduct(
       ).trim();
 
     if (
-      !FRENCH_KEYS.has(
+      !FRENCH_NAME_KEYS.has(
         normalize(
           firstName
         )
       )
     ) {
       firstName =
-        fallbackName(
-          index +
-            attempt,
-          reservedTitles
-        );
+        FRENCH_NAMES[
+          (
+            index +
+            attempt
+          ) %
+            FRENCH_NAMES.length
+        ];
     }
 
     const descriptor =
@@ -1552,24 +2014,32 @@ async function translateProduct(
         )
         .trim();
 
-    const title =
-      `${firstName} | ${descriptor}`.trim();
+    if (
+      !descriptor
+    ) {
+      continue;
+    }
 
-    const key =
-      normalize(
-        title
-      );
+    let title =
+      `${firstName} | ${descriptor}`.trim();
 
     payload.previousTitle =
       title;
 
     if (
-      !descriptor ||
-      !title.includes(
-        "|"
-      ) ||
       reservedTitles.has(
-        key
+        normalize(
+          title
+        )
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      !optionValuesUnique(
+        product,
+        result
       )
     ) {
       continue;
@@ -1588,18 +2058,37 @@ async function translateProduct(
       descriptionHtml
     );
 
+    if (
+      reservedTitles.has(
+        normalize(
+          title
+        )
+      )
+    ) {
+      title =
+        uniqueFallbackTitle(
+          descriptor,
+          reservedTitles,
+          index
+        );
+    }
+
     reservedTitles.add(
-      key
+      normalize(
+        title
+      )
     );
 
     return {
       title,
 
       productType:
-        String(
-          result.productType ||
-            ""
-        ).trim(),
+        product.productType
+          ? String(
+              result.productType ||
+                product.productType
+            ).trim()
+          : "",
 
       descriptionHtml,
 
@@ -1627,17 +2116,17 @@ async function translateProduct(
           result.media
         )
           ? result.media
-          : []
+          : [],
     };
   }
 
   throw new Error(
-    `Geen unieke Franse productnaam voor ${product.title}`
+    `Geen geldige unieke Franse vertaling voor "${product.title}".`
   );
 }
 
 /* =========================================================
-   PRODUCT UPDATES
+   PRODUCT WRITE
 ========================================================= */
 
 async function updateProduct(
@@ -1669,34 +2158,41 @@ async function updateProduct(
     }
   `;
 
+  const input = {
+    id:
+      product.id,
+
+    title:
+      translated.title,
+
+    descriptionHtml:
+      translated.descriptionHtml,
+
+    seo: {
+      title:
+        translated.seoTitle,
+
+      description:
+        translated.seoDescription,
+    },
+  };
+
+  if (
+    product.productType
+  ) {
+    input.productType =
+      translated.productType ||
+      product.productType;
+  }
+
   const data =
     await shopifyGraphQL(
       shop,
       token,
       mutation,
       {
-        product: {
-          id:
-            product.id,
-
-          title:
-            translated.title,
-
-          productType:
-            translated.productType ||
-            product.productType,
-
-          descriptionHtml:
-            translated.descriptionHtml,
-
-          seo: {
-            title:
-              translated.seoTitle,
-
-            description:
-              translated.seoDescription
-          }
-        }
+        product:
+          input,
       }
     );
 
@@ -1710,13 +2206,17 @@ async function updateProduct(
     throw new Error(
       errors
         .map(
-          (e) =>
-            e.message
+          (error) =>
+            error.message
         )
         .join(" | ")
     );
   }
 }
+
+/* =========================================================
+   OPTION WRITE
+========================================================= */
 
 async function updateOptions(
   shop,
@@ -1728,11 +2228,22 @@ async function updateOptions(
     const option of
       product.options
   ) {
+    if (
+      option.linkedMetafield
+    ) {
+      /*
+        A linked option is controlled through
+        its linked metafield. Do not mutate the
+        source value and risk breaking that link.
+      */
+      continue;
+    }
+
     const translatedOption =
       translated.options.find(
-        (x) =>
+        (item) =>
           Number(
-            x.index
+            item.index
           ) ===
           Number(
             option.position -
@@ -1746,10 +2257,12 @@ async function updateOptions(
       continue;
     }
 
-    const optionValuesToUpdate =
+    const updates =
       option.optionValues
         .map(
-          (original) => {
+          (
+            original
+          ) => {
             const match =
               (
                 translatedOption.values ||
@@ -1764,19 +2277,21 @@ async function updateOptions(
                   )
               );
 
-            if (!match) {
+            if (
+              !match
+            ) {
               return null;
             }
 
-            const name =
+            const value =
               String(
                 match.name ||
                   ""
               ).trim();
 
             if (
-              !name ||
-              name ===
+              !value ||
+              value ===
                 original.name.trim()
             ) {
               return null;
@@ -1786,7 +2301,8 @@ async function updateOptions(
               id:
                 original.id,
 
-              name
+              name:
+                value,
             };
           }
         )
@@ -1794,20 +2310,20 @@ async function updateOptions(
           Boolean
         );
 
-    const name =
+    const optionName =
       String(
         translatedOption.name ||
           ""
       ).trim();
 
     const nameChanged =
-      name &&
-      name !==
+      optionName &&
+      optionName !==
         option.name.trim();
 
     if (
       !nameChanged &&
-      !optionValuesToUpdate.length
+      !updates.length
     ) {
       continue;
     }
@@ -1850,20 +2366,20 @@ async function updateOptions(
               option.id,
 
             name:
-              name ||
+              optionName ||
               option.name,
 
             position:
-              option.position
+              option.position,
           },
 
-          optionValuesToUpdate
+          optionValuesToUpdate:
+            updates,
         }
       );
 
     const errors =
-      data
-        .productOptionUpdate
+      data.productOptionUpdate
         .userErrors || [];
 
     if (
@@ -1872,8 +2388,8 @@ async function updateOptions(
       throw new Error(
         errors
           .map(
-            (e) =>
-              e.message
+            (error) =>
+              error.message
           )
           .join(" | ")
       );
@@ -1881,70 +2397,79 @@ async function updateOptions(
   }
 }
 
-async function updateMedia(
+/* =========================================================
+   MEDIA ALT TEXT
+========================================================= */
+
+async function updateMediaAlt(
   shop,
   token,
   product,
   translated
 ) {
-  const media =
+  const files =
     translated.media
-      .filter(
-        (x) =>
-          x.id &&
-          typeof x.alt ===
-            "string"
-      )
       .map(
-        (x) => ({
-          id:
-            x.id,
-
-          alt:
-            x.alt
-        })
-      )
-      .filter(
-        (x) => {
+        (item) => {
           const original =
             product.media.nodes.find(
-              (m) =>
-                m.id ===
-                x.id
+              (media) =>
+                media.id ===
+                item.id
             );
 
-          return (
-            original &&
+          if (
+            !original ||
+            typeof item.alt !==
+              "string"
+          ) {
+            return null;
+          }
+
+          if (
             String(
               original.alt ||
                 ""
-            ) !==
-              x.alt
-          );
+            ) ===
+            String(
+              item.alt
+            )
+          ) {
+            return null;
+          }
+
+          return {
+            id:
+              item.id,
+
+            alt:
+              item.alt,
+          };
         }
+      )
+      .filter(
+        Boolean
       );
 
   if (
-    !media.length
+    !files.length
   ) {
     return;
   }
 
   const mutation = `
-    mutation UpdateMedia(
-      $productId: ID!,
-      $media: [UpdateMediaInput!]!
+    mutation UpdateFiles(
+      $files: [FileUpdateInput!]!
     ) {
-      productUpdateMedia(
-        productId: $productId,
-        media: $media
+      fileUpdate(
+        files: $files
       ) {
-        media {
+        files {
           id
           alt
         }
 
-        mediaUserErrors {
+        userErrors {
           field
           message
           code
@@ -1959,17 +2484,13 @@ async function updateMedia(
       token,
       mutation,
       {
-        productId:
-          product.id,
-
-        media
+        files,
       }
     );
 
   const errors =
-    data
-      .productUpdateMedia
-      .mediaUserErrors || [];
+    data.fileUpdate
+      .userErrors || [];
 
   if (
     errors.length
@@ -1977,26 +2498,773 @@ async function updateMedia(
     throw new Error(
       errors
         .map(
-          (e) =>
-            e.message
+          (error) =>
+            error.message
         )
         .join(" | ")
     );
   }
 }
 
-async function markDone(
+/* =========================================================
+   ONE PRODUCT
+========================================================= */
+
+async function processProduct(
   shop,
   token,
-  productId
+  product,
+  reservedTitles,
+  index
 ) {
+  const translated =
+    await translateProduct(
+      product,
+      reservedTitles,
+      index
+    );
+
+  await updateProduct(
+    shop,
+    token,
+    product,
+    translated
+  );
+
+  await updateOptions(
+    shop,
+    token,
+    product,
+    translated
+  );
+
+  await updateMediaAlt(
+    shop,
+    token,
+    product,
+    translated
+  );
+
+  await markDone(
+    shop,
+    token,
+    product.id
+  );
+
+  return translated;
+}
+
+/* =========================================================
+   BF SIZE CHARTS
+========================================================= */
+
+const BF_QUERY = `
+  query BFSizeCharts {
+    shop {
+      id
+
+      metafield(
+        namespace: "sizechartsrelentless"
+        key: "size_charts"
+      ) {
+        id
+        namespace
+        key
+        type
+        value
+        compareDigest
+      }
+    }
+  }
+`;
+
+async function getBFSizeCharts(
+  shop,
+  token
+) {
+  const data =
+    await shopifyGraphQL(
+      shop,
+      token,
+      BF_QUERY
+    );
+
+  return {
+    shopId:
+      data.shop.id,
+
+    metafield:
+      data.shop.metafield,
+  };
+}
+
+function isNumericLike(
+  value
+) {
+  const text =
+    String(
+      value || ""
+    ).trim();
+
+  if (
+    !text
+  ) {
+    return true;
+  }
+
+  return (
+    /^[-+]?\d+(?:[.,]\d+)?$/.test(
+      text
+    ) ||
+    /^[-+]?\d+(?:[.,]\d+)?\s*(?:cm|mm|m|kg|g|lb|lbs|in|inch|inches|%|°c|°f)$/i.test(
+      text
+    ) ||
+    /^\d+\s*[-–]\s*\d+$/.test(
+      text
+    ) ||
+    /^\d+(?:[.,]\d+)?\s*[x×]\s*\d+(?:[.,]\d+)?$/i.test(
+      text
+    )
+  );
+}
+
+function collectBFStrings(
+  node,
+  result = [],
+  currentPath = []
+) {
+  if (
+    Array.isArray(node)
+  ) {
+    node.forEach(
+      (
+        item,
+        index
+      ) =>
+        collectBFStrings(
+          item,
+          result,
+          currentPath.concat(
+            String(index)
+          )
+        )
+    );
+
+    return result;
+  }
+
+  if (
+    !node ||
+    typeof node !==
+      "object"
+  ) {
+    return result;
+  }
+
+  for (
+    const [
+      key,
+      value
+    ] of Object.entries(
+      node
+    )
+  ) {
+    const nextPath =
+      currentPath.concat(
+        key
+      );
+
+    const productConditionTitle =
+      key ===
+        "title" &&
+      node.type ===
+        "product" &&
+      node.id != null;
+
+    if (
+      typeof value ===
+        "string" &&
+      [
+        "buttonText",
+        "title",
+        "descriptionTop",
+        "descriptionBottom",
+      ].includes(
+        key
+      )
+    ) {
+      if (
+        !productConditionTitle &&
+        value.trim() &&
+        !isNumericLike(
+          value
+        )
+      ) {
+        result.push({
+          path:
+            nextPath,
+
+          text:
+            value,
+        });
+      }
+
+      continue;
+    }
+
+    if (
+      key.toLowerCase() ===
+        "values"
+    ) {
+      collectBFValues(
+        value,
+        result,
+        nextPath
+      );
+
+      continue;
+    }
+
+    collectBFStrings(
+      value,
+      result,
+      nextPath
+    );
+  }
+
+  return result;
+}
+
+function collectBFValues(
+  node,
+  result,
+  currentPath
+) {
+  if (
+    Array.isArray(node)
+  ) {
+    node.forEach(
+      (
+        item,
+        index
+      ) =>
+        collectBFValues(
+          item,
+          result,
+          currentPath.concat(
+            String(index)
+          )
+        )
+    );
+
+    return;
+  }
+
+  if (
+    typeof node ===
+      "string"
+  ) {
+    if (
+      node.trim() &&
+      !isNumericLike(
+        node
+      )
+    ) {
+      result.push({
+        path:
+          currentPath,
+
+        text:
+          node,
+      });
+    }
+
+    return;
+  }
+
+  if (
+    node &&
+    typeof node ===
+      "object"
+  ) {
+    for (
+      const [
+        key,
+        value
+      ] of Object.entries(
+        node
+      )
+    ) {
+      collectBFValues(
+        value,
+        result,
+        currentPath.concat(
+          key
+        )
+      );
+    }
+  }
+}
+
+function setDeepValue(
+  root,
+  pathParts,
+  value
+) {
+  let current =
+    root;
+
+  for (
+    let i = 0;
+    i <
+      pathParts.length -
+        1;
+    i++
+  ) {
+    current =
+      current[
+        pathParts[i]
+      ];
+  }
+
+  current[
+    pathParts[
+      pathParts.length -
+        1
+    ]
+  ] =
+    value;
+}
+
+async function translateBFStrings(
+  entries
+) {
+  const results =
+    new Array(
+      entries.length
+    );
+
+  const chunkSize =
+    60;
+
+  for (
+    let start = 0;
+    start <
+      entries.length;
+    start +=
+      chunkSize
+  ) {
+    const chunk =
+      entries.slice(
+        start,
+        start +
+          chunkSize
+      );
+
+    const payload = {
+      items:
+        chunk.map(
+          (
+            item,
+            index
+          ) => {
+            const prepared =
+              protectHtml(
+                item.text
+              );
+
+            return {
+              id:
+                index,
+
+              text:
+                prepared.html,
+
+              attributes:
+                prepared.attributes,
+            };
+          }
+        ),
+    };
+
+    const response =
+      await openAIJson(
+        BF_PROMPT,
+        {
+          type:
+            "object",
+
+          additionalProperties:
+            false,
+
+          properties: {
+            translations: {
+              type:
+                "array",
+
+              items: {
+                type:
+                  "object",
+
+                additionalProperties:
+                  false,
+
+                properties: {
+                  id: {
+                    type:
+                      "integer",
+                  },
+
+                  text: {
+                    type:
+                      "string",
+                  },
+                },
+
+                required: [
+                  "id",
+                  "text",
+                ],
+              },
+            },
+          },
+
+          required: [
+            "translations",
+          ],
+        },
+        payload
+      );
+
+    for (
+      const item of
+        response.translations ||
+        []
+    ) {
+      const index =
+        Number(
+          item.id
+        );
+
+      if (
+        !Number.isInteger(
+          index
+        ) ||
+        index < 0 ||
+        index >=
+          chunk.length
+      ) {
+        continue;
+      }
+
+      /*
+        BF strings may themselves contain HTML.
+        Preserve that HTML exactly.
+      */
+      const prepared =
+        protectHtml(
+          chunk[index].text
+        );
+
+      let restored =
+        String(
+          item.text ||
+            ""
+        );
+
+      try {
+        /*
+          When the BF string contains
+          HTML, OpenAI sees placeholders.
+          Reuse restoreHtml for safety.
+        */
+        const attrs =
+          Array.isArray(
+            item.attributes
+          )
+            ? item.attributes
+            : [];
+
+        restored =
+          restoreHtml(
+            restored,
+            prepared,
+            attrs
+          );
+      } catch {
+        /*
+          For plain text without HTML,
+          restoreHtml still works only
+          when there are zero tags.
+        */
+        if (
+          prepared.tags.length ===
+          0
+        ) {
+          restored =
+            String(
+              item.text ||
+                ""
+            );
+        } else {
+          throw new Error(
+            `BF HTML-vertaling ongeldig voor "${chunk[index].text}".`
+          );
+        }
+      }
+
+      assertHtmlSafe(
+        chunk[index].text,
+        restored
+      );
+
+      results[
+        start +
+          index
+      ] =
+        restored;
+    }
+  }
+
+  return results;
+}
+
+function syncBFProductTitles(
+  root,
+  renamedByLegacyId,
+  renamedByGid
+) {
+  if (
+    Array.isArray(root)
+  ) {
+    root.forEach(
+      (item) =>
+        syncBFProductTitles(
+          item,
+          renamedByLegacyId,
+          renamedByGid
+        )
+    );
+
+    return;
+  }
+
+  if (
+    !root ||
+    typeof root !==
+      "object"
+  ) {
+    return;
+  }
+
+  if (
+    root.type ===
+      "product" &&
+    typeof root.title ===
+      "string"
+  ) {
+    const id =
+      root.id != null
+        ? String(
+            root.id
+          )
+        : "";
+
+    if (
+      renamedByLegacyId.has(
+        id
+      )
+    ) {
+      root.title =
+        renamedByLegacyId.get(
+          id
+        );
+    } else if (
+      renamedByGid.has(
+        id
+      )
+    ) {
+      root.title =
+        renamedByGid.get(
+          id
+        );
+    }
+  }
+
+  Object.values(
+    root
+  ).forEach(
+    (value) =>
+      syncBFProductTitles(
+        value,
+        renamedByLegacyId,
+        renamedByGid
+      )
+  );
+}
+
+async function updateBFSizeCharts(
+  shop,
+  token,
+  products,
+  renamedProducts
+) {
+  const bf =
+    await getBFSizeCharts(
+      shop,
+      token
+    );
+
+  if (
+    !bf.metafield
+  ) {
+    log(
+      "BF size_charts niet gevonden; geen BF-write uitgevoerd."
+    );
+
+    return;
+  }
+
+  let original;
+
+  try {
+    original =
+      JSON.parse(
+        bf.metafield.value
+      );
+  } catch {
+    throw new Error(
+      "BF size_charts bevat ongeldige JSON."
+    );
+  }
+
+  const updated =
+    JSON.parse(
+      JSON.stringify(
+        original
+      )
+    );
+
+  const entries =
+    collectBFStrings(
+      updated
+    ).map(
+      (entry) => ({
+        ...entry,
+
+        prepared:
+          protectHtml(
+            entry.text
+          ),
+      })
+    );
+
+  if (
+    entries.length
+  ) {
+    log(
+      `BF: ${entries.length} tekstvelden gevonden.`
+    );
+
+    const translated =
+      await translateBFStrings(
+        entries
+      );
+
+    for (
+      let i = 0;
+      i <
+        entries.length;
+      i++
+    ) {
+      if (
+        typeof translated[i] !==
+          "string"
+      ) {
+        throw new Error(
+          `BF vertaling ontbreekt voor "${entries[i].text}".`
+        );
+      }
+
+      setDeepValue(
+        updated,
+        entries[i].path,
+        translated[i]
+      );
+    }
+  }
+
+  const renamedByLegacyId =
+    new Map();
+
+  const renamedByGid =
+    new Map();
+
+  for (
+    const product of
+      products
+  ) {
+    renamedByLegacyId.set(
+      String(
+        product.legacyResourceId
+      ),
+      product.title
+    );
+
+    renamedByGid.set(
+      String(
+        product.id
+      ),
+      product.title
+    );
+  }
+
+  for (
+    const [
+      id,
+      title
+    ] of
+      renamedProducts
+  ) {
+    if (
+      id.startsWith(
+        "gid://"
+      )
+    ) {
+      renamedByGid.set(
+        id,
+        title
+      );
+    } else {
+      renamedByLegacyId.set(
+        id,
+        title
+      );
+    }
+  }
+
+  syncBFProductTitles(
+    updated,
+    renamedByLegacyId,
+    renamedByGid
+  );
+
   const mutation = `
-    mutation MarkDone(
+    mutation UpdateBF(
       $metafields: [MetafieldsSetInput!]!
     ) {
       metafieldsSet(
         metafields: $metafields
       ) {
+        metafields {
+          id
+          namespace
+          key
+          type
+          value
+          compareDigest
+        }
+
         userErrors {
           field
           message
@@ -2015,27 +3283,33 @@ async function markDone(
         metafields: [
           {
             ownerId:
-              productId,
+              bf.shopId,
 
             namespace:
-              "maison_levara",
+              "sizechartsrelentless",
 
             key:
-              "fr_translation_v1",
+              "size_charts",
 
             type:
-              "single_line_text_field",
+              "json",
 
             value:
-              "done"
-          }
-        ]
+              JSON.stringify(
+                updated
+              ),
+
+            compareDigest:
+              bf.metafield
+                .compareDigest ||
+              null,
+          },
+        ],
       }
     );
 
   const errors =
-    data
-      .metafieldsSet
+    data.metafieldsSet
       .userErrors || [];
 
   if (
@@ -2044,130 +3318,21 @@ async function markDone(
     throw new Error(
       errors
         .map(
-          (e) =>
-            e.message
+          (error) =>
+            error.message
         )
         .join(" | ")
     );
   }
-}
-
-function isDone(
-  product
-) {
-  return product.metafields.nodes.some(
-    (x) =>
-      x.namespace ===
-        "maison_levara" &&
-      x.key ===
-        "fr_translation_v1" &&
-      x.value ===
-        "done"
-  );
-}
-
-async function processProduct(
-  shop,
-  token,
-  product,
-  reservedTitles,
-  index
-) {
-  const translated =
-    await translateProduct(
-      product,
-      reservedTitles,
-      index
-    );
 
   log(
-    `${product.title} -> ${translated.title}`
+    "BF Size Charts bijgewerkt."
   );
-
-  await updateProduct(
-    shop,
-    token,
-    product,
-    translated
-  );
-
-  await updateOptions(
-    shop,
-    token,
-    product,
-    translated
-  );
-
-  await updateMedia(
-    shop,
-    token,
-    product,
-    translated
-  );
-
-  await markDone(
-    shop,
-    token,
-    product.id
-  );
-
-  return translated;
 }
 
 /* =========================================================
-   JOBS
+   FULL JOB
 ========================================================= */
-
-async function runTestOne(
-  shop
-) {
-  const connection =
-    tokens.get(
-      shop
-    );
-
-  if (!connection) {
-    throw new Error(
-      "Shopify-token ontbreekt."
-    );
-  }
-
-  const products =
-    await getAllProducts(
-      shop,
-      connection.accessToken
-    );
-
-  const product =
-    products.find(
-      (p) =>
-        !isDone(p)
-    );
-
-  if (!product) {
-    throw new Error(
-      "Geen onvertaald product gevonden."
-    );
-  }
-
-  const reservedTitles =
-    new Set(
-      products.map(
-        (p) =>
-          normalize(
-            p.title
-          )
-      )
-    );
-
-  return processProduct(
-    shop,
-    connection.accessToken,
-    product,
-    reservedTitles,
-    0
-  );
-}
 
 async function runFullJob(
   shop
@@ -2177,7 +3342,9 @@ async function runFullJob(
       shop
     );
 
-  if (!connection) {
+  if (
+    !connection
+  ) {
     throw new Error(
       "Shopify-token ontbreekt."
     );
@@ -2224,7 +3391,7 @@ async function runFullJob(
 
   try {
     log(
-      "Alle producten ophalen..."
+      "Shopify-productcatalogus ophalen..."
     );
 
     const products =
@@ -2236,24 +3403,12 @@ async function runFullJob(
     job.total =
       products.length;
 
-    const reservedTitles =
-      new Set(
-        products
-          .map(
-            (p) =>
-              normalize(
-                p.title
-              )
-          )
-          .filter(
-            Boolean
-          )
-      );
-
     const pending =
       products.filter(
-        (p) =>
-          !isDone(p)
+        (product) =>
+          !isDone(
+            product
+          )
       );
 
     job.pending =
@@ -2263,8 +3418,59 @@ async function runFullJob(
       products.length -
       pending.length;
 
+    const reservedTitles =
+      new Set(
+        products.map(
+          (product) =>
+            normalize(
+              product.title
+            )
+        )
+      );
+
+    /*
+      old/new title map for BF.
+    */
+    const renamedProducts =
+      new Map();
+
+    /*
+      IMPORTANT:
+      Existing completed products already have
+      their final title. Store those too so BF
+      stays synchronized.
+    */
+    for (
+      const product of
+        products
+    ) {
+      if (
+        isDone(
+          product
+        )
+      ) {
+        renamedProducts.set(
+          String(
+            product.legacyResourceId
+          ),
+          product.title
+        );
+
+        renamedProducts.set(
+          String(
+            product.id
+          ),
+          product.title
+        );
+      }
+    }
+
     log(
-      `${products.length} producten gevonden; ${pending.length} te verwerken.`
+      `${products.length} producten gevonden.`
+    );
+
+    log(
+      `${pending.length} producten worden verwerkt.`
     );
 
     let cursor =
@@ -2272,7 +3478,7 @@ async function runFullJob(
 
     const workerCount =
       Math.min(
-        4,
+        3,
         Math.max(
           1,
           pending.length
@@ -2309,24 +3515,41 @@ async function runFullJob(
             pending.length,
 
           title:
-            product.title
+            product.title,
         };
 
         try {
-          await processProduct(
-            shop,
-            connection.accessToken,
-            product,
-            reservedTitles,
-            index
+          const translated =
+            await processProduct(
+              shop,
+              connection.accessToken,
+              product,
+              reservedTitles,
+              index
+            );
+
+          renamedProducts.set(
+            String(
+              product.legacyResourceId
+            ),
+            translated.title
+          );
+
+          renamedProducts.set(
+            String(
+              product.id
+            ),
+            translated.title
           );
 
           job.processed++;
 
           log(
-            `KLAAR ${index + 1}/${pending.length}: ${product.title}`
+            `KLAAR ${index + 1}/${pending.length}: ${product.title} -> ${translated.title}`
           );
-        } catch (error) {
+        } catch (
+          error
+        ) {
           job.failed++;
 
           const message =
@@ -2336,8 +3559,15 @@ async function runFullJob(
             message
           );
 
+          if (
+            job.errors.length >
+            100
+          ) {
+            job.errors.shift();
+          }
+
           log(
-            `FOUT: ${message}`
+            `FOUT ${index + 1}/${pending.length}: ${message}`
           );
         } finally {
           job.current =
@@ -2350,7 +3580,7 @@ async function runFullJob(
       Array.from(
         {
           length:
-            workerCount
+            workerCount,
         },
         (
           _,
@@ -2362,10 +3592,32 @@ async function runFullJob(
       )
     );
 
+    /*
+      Read again after product writes.
+    */
+    const updatedProducts =
+      await getAllProducts(
+        shop,
+        connection.accessToken
+      );
+
     log(
-      `JOB KLAAR — verwerkt ${job.processed}, overgeslagen ${job.skipped}, fouten ${job.failed}.`
+      "BF Size Chart verwerken..."
     );
-  } catch (error) {
+
+    await updateBFSizeCharts(
+      shop,
+      connection.accessToken,
+      updatedProducts,
+      renamedProducts
+    );
+
+    log(
+      `JOB KLAAR — verwerkt: ${job.processed}, overgeslagen: ${job.skipped}, fouten: ${job.failed}.`
+    );
+  } catch (
+    error
+  ) {
     job.failed++;
 
     job.errors.push(
@@ -2388,7 +3640,68 @@ async function runFullJob(
 }
 
 /* =========================================================
-   BASIC ROUTES
+   ONE-PRODUCT TEST
+========================================================= */
+
+async function runTestOne(
+  shop
+) {
+  const connection =
+    tokens.get(
+      shop
+    );
+
+  if (
+    !connection
+  ) {
+    throw new Error(
+      "Shopify-token ontbreekt."
+    );
+  }
+
+  const products =
+    await getAllProducts(
+      shop,
+      connection.accessToken
+    );
+
+  const product =
+    products.find(
+      (item) =>
+        !isDone(
+          item
+        )
+    );
+
+  if (
+    !product
+  ) {
+    throw new Error(
+      "Geen onvertaald product gevonden."
+    );
+  }
+
+  const reservedTitles =
+    new Set(
+      products.map(
+        (item) =>
+          normalize(
+            item.title
+          )
+      )
+    );
+
+  return processProduct(
+    shop,
+    connection.accessToken,
+    product,
+    reservedTitles,
+    0
+  );
+}
+
+/* =========================================================
+   HOME
 ========================================================= */
 
 app.get(
@@ -2406,6 +3719,10 @@ app.get(
   }
 );
 
+/* =========================================================
+   HEALTH
+========================================================= */
+
 app.get(
   "/health",
   (
@@ -2418,8 +3735,8 @@ app.get(
 
       shopifyConfigured:
         Boolean(
-          CLIENT_ID &&
-          CLIENT_SECRET &&
+          SHOPIFY_CLIENT_ID &&
+          SHOPIFY_CLIENT_SECRET &&
           REDIRECT_URI
         ),
 
@@ -2431,17 +3748,17 @@ app.get(
       model:
         OPENAI_MODEL,
 
-      apiVersion:
+      shopifyApiVersion:
         SHOPIFY_API_VERSION,
 
       scopes:
-        SCOPES
+        SHOPIFY_SCOPES,
     });
   }
 );
 
 /* =========================================================
-   OAUTH
+   AUTH START
 ========================================================= */
 
 app.get(
@@ -2454,7 +3771,9 @@ app.get(
       req.query.shop;
 
     if (
-      !validShop(shop)
+      !validShop(
+        shop
+      )
     ) {
       return res
         .status(400)
@@ -2464,8 +3783,8 @@ app.get(
     }
 
     if (
-      !CLIENT_ID ||
-      !CLIENT_SECRET ||
+      !SHOPIFY_CLIENT_ID ||
+      !SHOPIFY_CLIENT_SECRET ||
       !REDIRECT_URI
     ) {
       return res
@@ -2491,7 +3810,9 @@ app.get(
 
         expiresAt:
           Date.now() +
-          600000
+          10 *
+            60 *
+            1000,
       }
     );
 
@@ -2499,15 +3820,15 @@ app.get(
       `https://${shop}/admin/oauth/authorize?` +
       new URLSearchParams({
         client_id:
-          CLIENT_ID,
+          SHOPIFY_CLIENT_ID,
 
         scope:
-          SCOPES,
+          SHOPIFY_SCOPES,
 
         redirect_uri:
           REDIRECT_URI,
 
-        state
+        state,
       }).toString();
 
     res.redirect(
@@ -2515,6 +3836,10 @@ app.get(
     );
   }
 );
+
+/* =========================================================
+   AUTH CALLBACK
+========================================================= */
 
 app.get(
   "/auth/callback",
@@ -2525,11 +3850,13 @@ app.get(
     const {
       code,
       shop,
-      state
+      state,
     } = req.query;
 
     if (
-      !validShop(shop)
+      !validShop(
+        shop
+      )
     ) {
       return res
         .status(400)
@@ -2583,19 +3910,19 @@ app.get(
 
             headers: {
               "Content-Type":
-                "application/x-www-form-urlencoded"
+                "application/x-www-form-urlencoded",
             },
 
             body:
               new URLSearchParams({
                 client_id:
-                  CLIENT_ID,
+                  SHOPIFY_CLIENT_ID,
 
                 client_secret:
-                  CLIENT_SECRET,
+                  SHOPIFY_CLIENT_SECRET,
 
-                code
-              })
+                code,
+              }),
           }
         );
 
@@ -2622,13 +3949,13 @@ app.get(
             data.access_token,
 
           scope:
-            data.scope
+            data.scope,
         }
       );
 
       saveTokens();
 
-      setSession(
+      setSessionCookie(
         res,
         shop
       );
@@ -2656,7 +3983,9 @@ app.get(
         </p>
         `
       );
-    } catch (error) {
+    } catch (
+      error
+    ) {
       res
         .status(500)
         .send(
@@ -2667,7 +3996,7 @@ app.get(
 );
 
 /* =========================================================
-   PRODUCTS READ TEST
+   PRODUCTS READ CHECK
 ========================================================= */
 
 app.get(
@@ -2680,12 +4009,14 @@ app.get(
       req.query.shop;
 
     if (
-      !validShop(shop)
+      !validShop(
+        shop
+      )
     ) {
       return res
         .status(400)
         .send(
-          "Ongeldige shop."
+          "Ongeldige Shopify shop."
         );
     }
 
@@ -2694,7 +4025,9 @@ app.get(
         shop
       );
 
-    if (!connection) {
+    if (
+      !connection
+    ) {
       return res
         .status(401)
         .send(
@@ -2720,62 +4053,61 @@ app.get(
               10
             )
             .map(
-              (p) => ({
+              (product) => ({
                 id:
-                  p.id,
+                  product.id,
 
                 title:
-                  p.title,
-
-                productType:
-                  p.productType,
+                  product.title,
 
                 handle:
-                  p.handle,
+                  product.handle,
+
+                productType:
+                  product.productType,
 
                 options:
-                  p.options.map(
-                    (o) => ({
+                  product.options.map(
+                    (option) => ({
                       name:
-                        o.name,
+                        option.name,
 
                       values:
-                        o.optionValues.map(
-                          (v) =>
-                            v.name
-                        )
+                        option.optionValues.map(
+                          (value) =>
+                            value.name
+                        ),
                     })
                   ),
 
                 mediaCount:
-                  p.media.nodes
-                    .length,
+                  product.media.nodes.length,
 
                 metafieldCount:
-                  p.metafields.nodes
-                    .length,
+                  product.metafields.nodes.length,
 
                 translated:
                   isDone(
-                    p
-                  )
+                    product
+                  ),
               })
-            )
+            ),
       });
-    } catch (error) {
+    } catch (
+      error
+    ) {
       res
         .status(500)
         .json({
           error:
-            error.message
+            error.message,
         });
     }
   }
 );
 
 /* =========================================================
-   BF DIAGNOSTIC
-   READ-ONLY
+   BF DIAGNOSE
 ========================================================= */
 
 app.get(
@@ -2788,13 +4120,15 @@ app.get(
       req.query.shop;
 
     if (
-      !validShop(shop)
+      !validShop(
+        shop
+      )
     ) {
       return res
         .status(400)
         .json({
           error:
-            "Ongeldige shop."
+            "Ongeldige Shopify shop.",
         });
     }
 
@@ -2803,27 +4137,26 @@ app.get(
         shop
       );
 
-    if (!connection) {
+    if (
+      !connection
+    ) {
       return res
         .status(401)
         .json({
           error:
-            "Shopify is niet verbonden."
+            "Shopify is niet verbonden.",
         });
     }
 
     try {
-      const shopData =
-        await getShopBFMetafield(
+      const bf =
+        await getBFSizeCharts(
           shop,
           connection.accessToken
         );
 
-      const metafield =
-        shopData.metafield;
-
       if (
-        !metafield
+        !bf.metafield
       ) {
         return res
           .status(404)
@@ -2832,7 +4165,7 @@ app.get(
               false,
 
             message:
-              "BF-metafield sizechartsrelentless.size_charts niet gevonden."
+              "sizechartsrelentless.size_charts niet gevonden.",
           });
       }
 
@@ -2842,60 +4175,56 @@ app.get(
       try {
         parsed =
           JSON.parse(
-            metafield.value
+            bf.metafield.value
           );
       } catch {
         parsed =
           null;
       }
 
-      return res.json({
+      res.json({
         found:
           true,
 
-        shopId:
-          shopData.id,
-
         id:
-          metafield.id,
+          bf.metafield.id,
 
         namespace:
-          metafield.namespace,
+          bf.metafield.namespace,
 
         key:
-          metafield.key,
+          bf.metafield.key,
 
         type:
-          metafield.type,
+          bf.metafield.type,
 
         compareDigest:
-          metafield.compareDigest,
+          bf.metafield
+            .compareDigest,
 
         json:
           parsed,
 
         value:
           parsed === null
-            ? metafield.value
-            : undefined
+            ? bf.metafield.value
+            : undefined,
       });
-    } catch (error) {
-      console.error(
-        error
-      );
-
-      return res
+    } catch (
+      error
+    ) {
+      res
         .status(500)
         .json({
           error:
-            error.message
+            error.message,
         });
     }
   }
 );
 
 /* =========================================================
-   ADMIN PAGE
+   ADMIN
 ========================================================= */
 
 app.get(
@@ -2908,17 +4237,21 @@ app.get(
       req.query.shop;
 
     if (
-      !validShop(shop)
+      !validShop(
+        shop
+      )
     ) {
       return res
         .status(400)
         .send(
-          "Ongeldige shop."
+          "Ongeldige Shopify shop."
         );
     }
 
     if (
-      getSessionShop(req) !==
+      getSessionShop(
+        req
+      ) !==
       shop
     ) {
       return res
@@ -2944,98 +4277,49 @@ app.get(
 >
 
 <title>
-  Maison Lévara — Franse vertaling
+Maison Lévara — Franse vertaling
 </title>
 
 <style>
 
 body{
-  font-family:
-    Arial,
-    sans-serif;
-
-  max-width:
-    1000px;
-
-  margin:
-    40px auto;
-
-  padding:
-    0 20px;
-
-  color:
-    #111;
+  font-family:Arial,sans-serif;
+  max-width:1000px;
+  margin:40px auto;
+  padding:0 20px;
 }
 
 .card{
-  background:
-    #f5f5f5;
-
-  padding:
-    20px;
-
-  border-radius:
-    10px;
-
-  margin:
-    18px 0;
+  background:#f4f4f4;
+  padding:20px;
+  border-radius:10px;
+  margin:18px 0;
 }
 
 button{
-  background:
-    #111;
-
-  color:
-    #fff;
-
-  border:
-    0;
-
-  border-radius:
-    7px;
-
-  padding:
-    14px 20px;
-
-  margin:
-    5px 8px 5px 0;
-
-  cursor:
-    pointer;
-
-  font-size:
-    15px;
+  background:#111;
+  color:#fff;
+  border:0;
+  border-radius:7px;
+  padding:14px 20px;
+  margin:5px 8px 5px 0;
+  cursor:pointer;
+  font-size:15px;
 }
 
 button:disabled{
-  opacity:
-    .45;
-
-  cursor:
-    not-allowed;
+  opacity:.45;
+  cursor:not-allowed;
 }
 
 pre{
-  background:
-    #111;
-
-  color:
-    #eee;
-
-  padding:
-    16px;
-
-  border-radius:
-    8px;
-
-  white-space:
-    pre-wrap;
-
-  max-height:
-    500px;
-
-  overflow:
-    auto;
+  background:#111;
+  color:#eee;
+  padding:16px;
+  border-radius:8px;
+  white-space:pre-wrap;
+  max-height:520px;
+  overflow:auto;
 }
 
 </style>
@@ -3045,40 +4329,44 @@ pre{
 <body>
 
 <h1>
-  Maison Lévara Paris
+Maison Lévara Paris
 </h1>
 
 <h2>
-  Franse productvertaling
+Franse productvertaling
 </h2>
 
 <div class="card">
 
 <p>
-  <strong>Shop:</strong>
-  ${shop}
+<strong>Shop:</strong>
+${shop}
 </p>
 
 <p>
-  Producttitel, producttype,
-  volledige beschrijving, SEO,
-  opties, maten, kleuren en
-  media-altteksten worden vertaald.
+De automatisering vertaalt producttitel,
+producttype, volledige beschrijving, SEO,
+opties, maten, kleuren en media-altteksten.
 </p>
 
 <p>
-  <strong>Niet gewijzigd:</strong>
-  prijzen, voorraad, SKU's,
-  barcodes, handles,
-  afbeeldingen en ID's.
+De BF Size Charts worden na de productvertaling
+naar Frans bijgewerkt en productkoppelingen worden
+gesynchroniseerd met de nieuwe productnamen.
 </p>
 
 <p>
-  Productnaamstructuur:
-  <strong>
-    Franse voornaam |
-    Franse productomschrijving
-  </strong>
+<strong>
+Prijzen, voorraad, SKU's, barcodes, handles,
+afbeeldingen en product-ID's worden niet gewijzigd.
+</strong>
+</p>
+
+<p>
+Productnamen:
+<strong>
+Franse voornaam | Franse productomschrijving
+</strong>
 </p>
 
 </div>
@@ -3086,11 +4374,11 @@ pre{
 <div class="card">
 
 <button id="test">
-  Test 1 product
+Test 1 product
 </button>
 
 <button id="start">
-  Start alle producten
+Start alle producten
 </button>
 
 </div>
@@ -3099,18 +4387,16 @@ pre{
   id="status"
   class="card"
 >
-  Status laden...
+Status laden...
 </div>
 
 <div class="card">
 
 <h3>
-  Log
+Log
 </h3>
 
-<pre
-  id="logs"
->
+<pre id="logs">
 Wachten...
 </pre>
 
@@ -3119,17 +4405,17 @@ Wachten...
 <script>
 
 const shop =
-  ${JSON.stringify(shop)};
+${JSON.stringify(shop)};
 
 const test =
-  document.getElementById(
-    "test"
-  );
+document.getElementById(
+  "test"
+);
 
 const start =
-  document.getElementById(
-    "start"
-  );
+document.getElementById(
+  "start"
+);
 
 async function refresh(){
 
@@ -3175,13 +4461,13 @@ async function refresh(){
       (
         data.current
           ? (
-            "<br><br><strong>Huidig:</strong> " +
-            data.current.index +
-            "/" +
-            data.current.total +
-            " — " +
-            data.current.title
-          )
+              "<br><br><strong>Huidig:</strong> " +
+              data.current.index +
+              "/" +
+              data.current.total +
+              " — " +
+              data.current.title
+            )
           : ""
       );
 
@@ -3276,7 +4562,7 @@ start.onclick =
 
     if(
       !confirm(
-        "Dit start alle nog niet verwerkte producten. Doorgaan?"
+        "Dit start alle nog niet verwerkte producten en werkt daarna de BF Size Charts bij. Doorgaan?"
       )
     ){
       return;
@@ -3348,7 +4634,7 @@ setInterval(
 );
 
 /* =========================================================
-   TEST ONE PRODUCT
+   START ONE
 ========================================================= */
 
 app.post(
@@ -3361,25 +4647,29 @@ app.post(
       req.body?.shop;
 
     if (
-      !validShop(shop)
+      !validShop(
+        shop
+      )
     ) {
       return res
         .status(400)
         .json({
           error:
-            "Ongeldige shop."
+            "Ongeldige Shopify shop.",
         });
     }
 
     if (
-      getSessionShop(req) !==
+      getSessionShop(
+        req
+      ) !==
       shop
     ) {
       return res
         .status(403)
         .json({
           error:
-            "Geen geldige sessie."
+            "Geen geldige sessie.",
         });
     }
 
@@ -3390,12 +4680,12 @@ app.post(
         .status(409)
         .json({
           error:
-            "Er draait al een job."
+            "Er draait al een job.",
         });
     }
 
     try {
-      const translated =
+      const result =
         await runTestOne(
           shop
         );
@@ -3405,21 +4695,23 @@ app.post(
           true,
 
         newTitle:
-          translated.title
+          result.title,
       });
-    } catch (error) {
+    } catch (
+      error
+    ) {
       res
         .status(500)
         .json({
           error:
-            error.message
+            error.message,
         });
     }
   }
 );
 
 /* =========================================================
-   START ALL PRODUCTS
+   START ALL
 ========================================================= */
 
 app.post(
@@ -3432,25 +4724,29 @@ app.post(
       req.body?.shop;
 
     if (
-      !validShop(shop)
+      !validShop(
+        shop
+      )
     ) {
       return res
         .status(400)
         .json({
           error:
-            "Ongeldige shop."
+            "Ongeldige Shopify shop.",
         });
     }
 
     if (
-      getSessionShop(req) !==
+      getSessionShop(
+        req
+      ) !==
       shop
     ) {
       return res
         .status(403)
         .json({
           error:
-            "Geen geldige sessie."
+            "Geen geldige sessie.",
         });
     }
 
@@ -3461,7 +4757,7 @@ app.post(
         .status(409)
         .json({
           error:
-            "Er draait al een job."
+            "Er draait al een job.",
         });
     }
 
@@ -3474,7 +4770,7 @@ app.post(
         .status(401)
         .json({
           error:
-            "Shopify-token ontbreekt."
+            "Shopify-token ontbreekt.",
         });
     }
 
@@ -3485,7 +4781,7 @@ app.post(
         .status(500)
         .json({
           error:
-            "OPENAI_API_KEY ontbreekt."
+            "OPENAI_API_KEY ontbreekt.",
         });
     }
 
@@ -3503,13 +4799,13 @@ app.post(
       .status(202)
       .json({
         ok:
-          true
+          true,
       });
   }
 );
 
 /* =========================================================
-   JOB STATUS
+   STATUS
 ========================================================= */
 
 app.get(
@@ -3522,14 +4818,16 @@ app.get(
       req.query.shop;
 
     if (
-      getSessionShop(req) !==
+      getSessionShop(
+        req
+      ) !==
       shop
     ) {
       return res
         .status(403)
         .json({
           error:
-            "Geen geldige sessie."
+            "Geen geldige sessie.",
         });
     }
 
@@ -3567,15 +4865,15 @@ app.get(
       finishedAt:
         job.finishedAt,
 
+      logs:
+        job.logs.slice(
+          -150
+        ),
+
       errors:
         job.errors.slice(
           -30
         ),
-
-      logs:
-        job.logs.slice(
-          -100
-        )
     });
   }
 );
