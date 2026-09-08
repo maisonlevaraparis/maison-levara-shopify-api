@@ -2452,7 +2452,75 @@ if (
   );
 }
 
-app.listen(
+app.get(
+  "/bf-diagnose",
+  async (req, res) => {
+    const shop = req.query.shop;
+
+    if (!validShop(shop)) {
+      return res.status(400).json({
+        error: "Ongeldige shop."
+      });
+    }
+
+    const connection = shopTokens.get(shop);
+
+    if (!connection) {
+      return res.status(401).json({
+        error: "Shopify is niet verbonden."
+      });
+    }
+
+    const query = `
+      query BFSizeChart {
+        shop {
+          metafield(
+            namespace: "sizechartsrelentless"
+            key: "size_charts"
+          ) {
+            id
+            namespace
+            key
+            type
+            value
+            compareDigest
+          }
+        }
+      }
+    `;
+
+    try {
+      const data = await shopifyGraphQL(
+        shop,
+        connection.accessToken,
+        query
+      );
+
+      if (!data.shop.metafield) {
+        return res.status(404).json({
+          found: false,
+          message:
+            "BF-metafield sizechartsrelentless.size_charts niet gevonden."
+        });
+      }
+
+      res.json({
+        found: true,
+        id: data.shop.metafield.id,
+        namespace: data.shop.metafield.namespace,
+        key: data.shop.metafield.key,
+        type: data.shop.metafield.type,
+        compareDigest:
+          data.shop.metafield.compareDigest,
+        value: data.shop.metafield.value
+      });
+    } catch (error) {
+      res.status(500).json({
+        error: error.message
+      });
+    }
+  }
+);app.listen(
   PORT,
   () => {
     console.log(
