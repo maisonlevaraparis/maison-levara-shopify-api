@@ -8,14 +8,9 @@ const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const REDIRECT_URI = process.env.REDIRECT_URI;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
 
-// Shopify stable Admin GraphQL API release.
 const SHOPIFY_API_VERSION = "2026-07";
-
-// OpenAI model can be changed in Render with OPENAI_MODEL.
-// Default chosen for cost-sensitive, high-volume translation work.
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.6-luna";
-
 const SHOPIFY_SCOPES = "write_products";
 
 const oauthStates = new Map();
@@ -44,10 +39,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function validShop(shop) {
+function isValidShop(shop) {
   return (
     typeof shop === "string" &&
-    /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/.test(shop)
+    /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i.test(shop)
   );
 }
 
@@ -60,12 +55,12 @@ function normalize(value) {
     .trim();
 }
 
-function addLog(message) {
+function log(message) {
   const line = `[${new Date().toISOString()}] ${message}`;
 
   job.logs.push(line);
 
-  if (job.logs.length > 250) {
+  if (job.logs.length > 300) {
     job.logs.shift();
   }
 
@@ -73,50 +68,53 @@ function addLog(message) {
 }
 
 function parseCookies(req) {
-  const result = {};
+  const cookies = {};
 
-  for (const part of (req.headers.cookie || "").split(";")) {
-    const index = part.indexOf("=");
+  for (const piece of (req.headers.cookie || "").split(";")) {
+    const i = piece.indexOf("=");
 
-    if (index < 0) {
+    if (i < 0) {
       continue;
     }
 
-    const key = part.slice(0, index).trim();
-    const value = part.slice(index + 1).trim();
-
-    result[key] = decodeURIComponent(value);
+    cookies[piece.slice(0, i).trim()] =
+      decodeURIComponent(piece.slice(i + 1).trim());
   }
 
-  return result;
+  return cookies;
 }
 
-function createSession(shop) {
-  const sessionId = crypto.randomBytes(32).toString("hex");
+function setSession(res, shop) {
+  const id = crypto.randomBytes(32).toString("hex");
 
-  sessions.set(sessionId, {
+  sessions.set(id, {
     shop,
     expiresAt: Date.now() + 24 * 60 * 60 * 1000,
   });
 
-  return sessionId;
+  res.setHeader(
+    "Set-Cookie",
+    `ml_session=${encodeURIComponent(
+      id
+    )}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400`
+  );
 }
 
 function sessionShop(req) {
-  const sessionId = parseCookies(req).ml_session;
+  const id = parseCookies(req).ml_session;
 
-  if (!sessionId) {
+  if (!id) {
     return null;
   }
 
-  const session = sessions.get(sessionId);
+  const session = sessions.get(id);
 
   if (!session) {
     return null;
   }
 
   if (session.expiresAt < Date.now()) {
-    sessions.delete(sessionId);
+    sessions.delete(id);
     return null;
   }
 
@@ -142,8 +140,8 @@ function verifyHmac(query) {
 
   try {
     return crypto.timingSafeEqual(
-      Buffer.from(digest, "utf8"),
-      Buffer.from(String(hmac), "utf8")
+      Buffer.from(digest),
+      Buffer.from(String(hmac))
     );
   } catch {
     return false;
@@ -158,7 +156,7 @@ async function shopifyGraphQL(
 ) {
   let lastError = null;
 
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (let attempt = 0; attempt < 6; attempt++) {
     try {
       const response = await fetch(
         `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
@@ -180,7 +178,9 @@ async function shopifyGraphQL(
       const body = await response.json();
 
       if (response.status === 429) {
-        lastError = new Error("Shopify rate limit.");
+        lastError = new Error(
+          "Shopify rate limit."
+        );
 
         await sleep(
           1000 * 2 ** attempt
@@ -191,7 +191,9 @@ async function shopifyGraphQL(
 
       if (!response.ok) {
         throw new Error(
-          `Shopify HTTP ${response.status}: ${JSON.stringify(body)}`
+          `Shopify HTTP ${response.status}: ${JSON.stringify(
+            body
+          )}`
         );
       }
 
@@ -217,7 +219,7 @@ async function shopifyGraphQL(
     } catch (error) {
       lastError = error;
 
-      if (attempt === 4) {
+      if (attempt === 5) {
         break;
       }
 
@@ -229,7 +231,9 @@ async function shopifyGraphQL(
 
   throw (
     lastError ||
-    new Error("Shopify request failed.")
+    new Error(
+      "Shopify request failed."
+    )
   );
 }
 
@@ -244,7 +248,10 @@ async function getAllProducts(
 
   const query = `
     query GetProducts($after: String) {
-      products(first: 100, after: $after) {
+      products(
+        first: 100
+        after: $after
+      ) {
         nodes {
           id
           title
@@ -261,16 +268,14 @@ async function getAllProducts(
             name
             position
 
-            optionValues(first: 100) {
-              nodes {
-                id
-                name
-              }
+            optionValues {
+              id
+              name
             }
           }
 
           metafields(
-            first: 20
+            first: 10
             namespace: "maison_levara"
           ) {
             nodes {
@@ -290,14 +295,13 @@ async function getAllProducts(
   `;
 
   while (hasNextPage) {
-    const data = await shopifyGraphQL(
-      shop,
-      accessToken,
-      query,
-      {
-        after,
-      }
-    );
+    const data =
+      await shopifyGraphQL(
+        shop,
+        accessToken,
+        query,
+        { after }
+      );
 
     products.push(
       ...data.products.nodes
@@ -313,8 +317,6 @@ async function getAllProducts(
   return products;
 }
 
-// Franse voornamen voor de productnaamstructuur.
-// Vorm: Voornaam | Productomschrijving
 const FRENCH_FIRST_NAMES = [
   "Adèle",
   "Agathe",
@@ -403,7 +405,6 @@ const FRENCH_FIRST_NAMES = [
   "Odette",
   "Pauline",
   "Perrine",
-  "Priscille",
   "Rachel",
   "Raphaëlle",
   "Romane",
@@ -429,44 +430,48 @@ const FRENCH_FIRST_NAMES = [
   "Zoé",
 ];
 
-const FRENCH_NAME_KEYS = new Set(
-  FRENCH_FIRST_NAMES.map(normalize)
-);
+const FRENCH_NAME_KEYS =
+  new Set(
+    FRENCH_FIRST_NAMES.map(
+      normalize
+    )
+  );
 
-function fallbackFirstName(
+function chooseFallbackName(
   reservedTitles,
   seed
 ) {
   for (
-    let offset = 0;
-    offset < FRENCH_FIRST_NAMES.length;
-    offset++
+    let i = 0;
+    i < FRENCH_FIRST_NAMES.length;
+    i++
   ) {
     const name =
       FRENCH_FIRST_NAMES[
-        (seed + offset) %
+        (seed + i) %
           FRENCH_FIRST_NAMES.length
       ];
 
     const prefix =
-      `${normalize(name)} `;
+      `${normalize(name)} |`;
 
-    const used = [...reservedTitles].some(
-      (title) =>
-        normalize(title).startsWith(prefix)
-    );
+    const used =
+      [...reservedTitles].some(
+        (title) =>
+          normalize(title).startsWith(
+            prefix
+          )
+      );
 
     if (!used) {
       return name;
     }
   }
 
-  return (
-    FRENCH_FIRST_NAMES[
-      seed %
-        FRENCH_FIRST_NAMES.length
-    ]
-  );
+  return FRENCH_FIRST_NAMES[
+    seed %
+      FRENCH_FIRST_NAMES.length
+  ];
 }
 
 function protectHtml(html) {
@@ -477,7 +482,9 @@ function protectHtml(html) {
       /<[^>]*>/g,
       (tag) => {
         const token =
-          `__ML_TAG_${String(tags.length).padStart(5, "0")}__`;
+          `___ML_HTML_TAG_${String(
+            tags.length
+          ).padStart(5, "0")}___`;
 
         tags.push({
           token,
@@ -501,25 +508,36 @@ function restoreHtml(
   let result =
     String(translated || "");
 
-  for (const { token, tag } of tags) {
+  for (
+    const {
+      token,
+      tag,
+    } of tags
+  ) {
     const count =
-      result.split(token).length - 1;
+      result.split(token)
+        .length - 1;
 
     if (count !== 1) {
       throw new Error(
-        `HTML-structuur beschadigd: ${token} kwam ${count} keer terug.`
+        `HTML-structuur beschadigd bij ${token}.`
       );
     }
 
     result =
-      result.replace(token, tag);
+      result.replace(
+        token,
+        tag
+      );
   }
 
   if (
-    /__ML_TAG_\d{5}__/.test(result)
+    /___ML_HTML_TAG_\d{5}___/.test(
+      result
+    )
   ) {
     throw new Error(
-      "Onvertaalde HTML-placeholder gevonden."
+      "HTML-placeholder ontbreekt of is aangepast."
     );
   }
 
@@ -531,21 +549,23 @@ function buildTitle(
   descriptor
 ) {
   const first =
-    String(firstName || "")
+    String(
+      firstName || ""
+    )
       .replace(/\|/g, " ")
       .trim();
 
   const desc =
-    String(descriptor || "")
+    String(
+      descriptor || ""
+    )
       .replace(/\|/g, " ")
       .trim();
 
-  return `${first} | ${desc}`;
+  return `${first} | ${desc}`.trim();
 }
 
-function isAlreadyTranslated(
-  product
-) {
+function isDone(product) {
   return product.metafields.nodes.some(
     (metafield) =>
       metafield.namespace ===
@@ -556,194 +576,7 @@ function isAlreadyTranslated(
   );
 }
 
-function productInputForAI(
-  product
-) {
-  const protectedDescription =
-    protectHtml(
-      product.descriptionHtml || ""
-    );
-
-  return {
-    productId: product.id,
-
-    currentTitle:
-      product.title,
-
-    descriptionHtml:
-      protectedDescription.protectedHtml,
-
-    htmlPlaceholders:
-      protectedDescription.tags.map(
-        (item) => item.token
-      ),
-
-    seo: {
-      title:
-        product.seo?.title || "",
-
-      description:
-        product.seo?.description || "",
-    },
-
-    options:
-      product.options.map(
-        (option, index) => ({
-          index,
-
-          id:
-            option.id,
-
-          name:
-            option.name,
-
-          values:
-            option.optionValues.nodes.map(
-              (value) => ({
-                id:
-                  value.id,
-
-                name:
-                  value.name,
-              })
-            ),
-        })
-      ),
-  };
-}
-
-const AI_INSTRUCTIONS = `
-Je bent de vaste Franse e-commerce copywriter
-van Maison Lévara Paris.
-
-Vertaal de aangeleverde productdata naar
-natuurlijk, professioneel Frans voor een
-moderne Franse modewebshop.
-
-==============================
-PRODUCTNAAM
-==============================
-
-Gebruik exact deze structuur:
-
-"FranseVoornaam | Franse productomschrijving"
-
-De eerste helft moet een echte Franse
-voornaam zijn.
-
-De tweede helft moet een korte, natuurlijke
-Franse omschrijving van het producttype zijn.
-
-Gebruik geen Nederlandse, Engelse, Italiaanse
-of Spaanse productnamen.
-
-Gebruik geen overdreven marketingtaal.
-
-De stijl moet aansluiten op een Europese
-fashionstore zoals de oude Luno Milano-structuur:
-een voornaam, dan " | ", dan een duidelijke
-productomschrijving.
-
-==============================
-BESCHRIJVING
-==============================
-
-Vertaal alle klantzichtbare tekst naar Frans.
-
-Vertaal ook tekst binnen maattabellen.
-
-Behandel de maattabel als normale klantzichtbare
-productinhoud.
-
-Behoud:
-- HTML-structuur
-- HTML-placeholders
-- links
-- afbeeldingen
-- URLs
-- classes
-- ids
-- data-attributen
-- cijfers
-- percentages
-- afmetingen
-- eenheden
-
-Wijzig geen URL's.
-
-Voeg geen HTML-tags toe.
-
-Verwijder geen HTML-tags.
-
-De meegeleverde HTML-placeholders moeten
-exact behouden blijven en ieder exact één keer
-terugkomen.
-
-Behoud XS, S, M, L, XL, XXL, 2XL enzovoort.
-
-Vertaal "One Size" als "Taille unique".
-
-Vertaal kleurwaarden naar natuurlijk Frans.
-
-Vertaal optie-namen zoals:
-Size -> Taille
-Color -> Couleur
-Material -> Matière
-
-Vertaal ook gewone taalwaarden van opties.
-
-==============================
-SEO
-==============================
-
-Vertaal SEO title naar natuurlijk Frans.
-
-Houd SEO title waar praktisch rond maximaal
-60 tekens.
-
-Vertaal SEO description naar natuurlijk Frans.
-
-Houd SEO description waar praktisch rond
-150-160 tekens.
-
-==============================
-OPTIES
-==============================
-
-Geef voor iedere bestaande optie exact dezelfde
-index terug.
-
-Geef iedere bestaande option value exact
-dezelfde id terug.
-
-Vertaal option names.
-
-Vertaal gewone taalwaarden.
-
-Laat gestandaardiseerde maatcodes en numerieke
-maten intact.
-
-==============================
-UNIEKE PRODUCTNAMEN
-==============================
-
-De volledige Franse producttitel moet uniek
-zijn binnen de volledige catalogus.
-
-Gebruik nooit een titel uit de lijst met reeds
-bestaande catalogustitels.
-
-Gebruik ook nooit een titel die door een andere
-worker al is gereserveerd.
-
-De uiteindelijke titel moet altijd zijn:
-
-"FranseVoornaam | Franse productomschrijving"
-
-Geef uitsluitend JSON volgens het schema.
-`;
-
-const AI_SCHEMA = {
+const translationSchema = {
   type: "object",
 
   additionalProperties: false,
@@ -831,7 +664,136 @@ const AI_SCHEMA = {
   ],
 };
 
-function openAIText(body) {
+const SYSTEM_PROMPT = `
+Je bent de vaste Franse e-commerce copywriter van Maison Lévara Paris.
+
+VERTAAL ALLE KLANTZICHTBARE PRODUCTINHOUD NAAR NATUURLIJK, PROFESSIONEEL FRANS.
+
+PRODUCTNAAM:
+Gebruik exact:
+"Franse voornaam | Franse productomschrijving"
+
+De eerste helft moet een echte Franse voornaam zijn.
+De tweede helft is een korte natuurlijke Franse productomschrijving.
+
+Gebruik geen Nederlandse, Engelse, Italiaanse of Spaanse woorden in de producttitel.
+
+De stijl moet passen bij een Europese fashionstore en bij de productnaamstructuur die we voor Luno Milano gebruikten.
+
+BESCHRIJVING:
+Vertaal alle zichtbare producttekst naar Frans.
+
+Dit geldt ook voor:
+- maattabellen
+- tabelkoppen
+- tabeltekst
+- zichtbare tekst in HTML
+- normale tekst in alt/title-attributen
+
+Behoud exact:
+- HTML-tags
+- HTML-placeholders
+- href-URLs
+- src-URLs
+- classes
+- ids
+- data-attributen
+- cijfers
+- maten
+- percentages
+- eenheden
+- productcodes
+- technische codes
+
+Voeg geen HTML-tags toe.
+Verwijder geen HTML-tags.
+Wijzig geen URL's.
+
+XS, S, M, L, XL, XXL en numerieke maten blijven als maatcodes bestaan.
+"One Size" wordt "Taille unique".
+
+OPTIES:
+Size -> Taille
+Color -> Couleur
+Material -> Matière
+
+Vertaal gewone kleurwaarden naar natuurlijk Frans.
+Vertaal gewone tekstuele waarden naar natuurlijk Frans.
+Laat numerieke maten en standaard maatcodes intact.
+
+SEO:
+Vertaal SEO title en SEO description naar natuurlijk Frans.
+Geen keyword stuffing.
+
+UNIEKE PRODUCTNAAM:
+De volledige uiteindelijke titel mag niet dubbel voorkomen in de catalogus.
+`;
+
+function productPayload(
+  product,
+  reservedTitles,
+  htmlData
+) {
+  return {
+    currentTitle:
+      product.title,
+
+    descriptionHtml:
+      htmlData.protectedHtml,
+
+    htmlPlaceholders:
+      htmlData.tags.map(
+        (item) =>
+          item.token
+      ),
+
+    seo: {
+      title:
+        product.seo?.title || "",
+
+      description:
+        product.seo?.description ||
+        "",
+    },
+
+    existingCatalogTitles:
+      [...reservedTitles].slice(
+        0,
+        150
+      ),
+
+    options:
+      product.options.map(
+        (
+          option,
+          index
+        ) => ({
+          index,
+
+          id:
+            option.id,
+
+          name:
+            option.name,
+
+          values:
+            option.optionValues.map(
+              (value) => ({
+                id:
+                  value.id,
+
+                name:
+                  value.name,
+              })
+            ),
+        })
+      ),
+  };
+}
+
+function extractOutputText(
+  body
+) {
   if (
     typeof body.output_text ===
     "string"
@@ -841,15 +803,19 @@ function openAIText(body) {
 
   for (
     const item of
-    Array.isArray(body.output)
-      ? body.output
-      : []
+      Array.isArray(
+        body.output
+      )
+        ? body.output
+        : []
   ) {
     for (
       const content of
-      Array.isArray(item.content)
-        ? item.content
-        : []
+        Array.isArray(
+          item.content
+        )
+          ? item.content
+          : []
     ) {
       if (
         typeof content?.text ===
@@ -887,7 +853,7 @@ async function openAIJson(
         setTimeout(
           () =>
             controller.abort(),
-          150000
+          180000
         );
 
       const response =
@@ -913,6 +879,11 @@ async function openAIJson(
 
               store: false,
 
+              reasoning: {
+                effort:
+                  "minimal",
+              },
+
               input: [
                 {
                   role: "system",
@@ -923,7 +894,7 @@ async function openAIJson(
                         "input_text",
 
                       text:
-                        AI_INSTRUCTIONS,
+                        SYSTEM_PROMPT,
                     },
                   ],
                 },
@@ -953,10 +924,11 @@ async function openAIJson(
                   name:
                     "maison_levara_translation",
 
-                  strict: true,
+                  strict:
+                    true,
 
                   schema:
-                    AI_SCHEMA,
+                    translationSchema,
                 },
               },
             }),
@@ -977,7 +949,8 @@ async function openAIJson(
           );
 
         await sleep(
-          1500 * 2 ** attempt
+          1500 *
+            2 ** attempt
         );
 
         continue;
@@ -985,29 +958,39 @@ async function openAIJson(
 
       if (!response.ok) {
         throw new Error(
-          `OpenAI HTTP ${response.status}: ${JSON.stringify(body)}`
+          `OpenAI HTTP ${response.status}: ${JSON.stringify(
+            body
+          )}`
         );
       }
 
       const text =
-        openAIText(body);
+        extractOutputText(
+          body
+        );
 
       if (!text) {
         throw new Error(
-          "OpenAI gaf geen resultaat terug."
+          "OpenAI gaf geen bruikbaar resultaat terug."
         );
       }
 
-      return JSON.parse(text);
+      return JSON.parse(
+        text
+      );
     } catch (error) {
-      lastError = error;
+      lastError =
+        error;
 
-      if (attempt === 4) {
+      if (
+        attempt === 4
+      ) {
         break;
       }
 
       await sleep(
-        1500 * 2 ** attempt
+        1500 *
+          2 ** attempt
       );
     }
   }
@@ -1015,40 +998,40 @@ async function openAIJson(
   throw (
     lastError ||
     new Error(
-      "OpenAI request failed."
+      "OpenAI request mislukt."
     )
   );
 }
 
-async function makeTranslation(
+async function translateProduct(
   product,
   reservedTitles,
   index
 ) {
-  const originalTags =
+  const htmlData =
     protectHtml(
-      product.descriptionHtml || ""
-    ).tags;
+      product.descriptionHtml ||
+        ""
+    );
 
-  let previousTitle = "";
+  let rejectedTitle =
+    "";
 
   for (
     let attempt = 0;
-    attempt < 5;
+    attempt < 6;
     attempt++
   ) {
     const payload =
-      productInputForAI(
-        product
+      productPayload(
+        product,
+        reservedTitles,
+        htmlData
       );
 
-    payload.existingTitles =
-      [...reservedTitles]
-        .slice(0, 100);
-
     payload.retryInstruction =
-      previousTitle
-        ? `Deze titel was al bezet: "${previousTitle}". Kies beslist een andere Franse titel.`
+      rejectedTitle
+        ? `De vorige titel was niet toegestaan omdat hij al bestond: ${rejectedTitle}. Kies een andere Franse titel.`
         : "";
 
     const result =
@@ -1058,18 +1041,22 @@ async function makeTranslation(
 
     let firstName =
       String(
-        result.firstName || ""
+        result.firstName ||
+          ""
       ).trim();
 
     if (
       !FRENCH_NAME_KEYS.has(
-        normalize(firstName)
+        normalize(
+          firstName
+        )
       )
     ) {
       firstName =
-        fallbackFirstName(
+        chooseFallbackName(
           reservedTitles,
-          index + attempt
+          index +
+            attempt
         );
     }
 
@@ -1079,27 +1066,33 @@ async function makeTranslation(
         result.descriptor
       );
 
-    const key =
-      normalize(title);
+    const titleKey =
+      normalize(
+        title
+      );
 
     if (
-      !result.descriptor?.trim() ||
       !title.includes("|") ||
-      reservedTitles.has(key)
+      !result.descriptor?.trim() ||
+      reservedTitles.has(
+        titleKey
+      )
     ) {
-      previousTitle = title;
+      rejectedTitle =
+        title;
+
       continue;
     }
-
-    // Reserve immediately so another worker
-    // cannot generate the same product title.
-    reservedTitles.add(key);
 
     const descriptionHtml =
       restoreHtml(
         result.descriptionHtml,
-        originalTags
+        htmlData.tags
       );
+
+    reservedTitles.add(
+      titleKey
+    );
 
     return {
       title,
@@ -1108,12 +1101,14 @@ async function makeTranslation(
 
       seoTitle:
         String(
-          result.seoTitle || ""
+          result.seoTitle ||
+            ""
         ).trim(),
 
       seoDescription:
         String(
-          result.seoDescription || ""
+          result.seoDescription ||
+            ""
         ).trim(),
 
       options:
@@ -1126,7 +1121,7 @@ async function makeTranslation(
   }
 
   throw new Error(
-    `Geen unieke Franse productnaam gevonden voor: ${product.title}`
+    `Geen unieke Franse productnaam kunnen genereren voor ${product.title}.`
   );
 }
 
@@ -1136,7 +1131,6 @@ async function updateProduct(
   product,
   translation
 ) {
-  // 1. Producttitel, beschrijving en SEO.
   const productMutation = `
     mutation UpdateProduct(
       $product: ProductUpdateInput!
@@ -1159,7 +1153,7 @@ async function updateProduct(
     }
   `;
 
-  const productData =
+  const data =
     await shopifyGraphQL(
       shop,
       accessToken,
@@ -1187,7 +1181,7 @@ async function updateProduct(
     );
 
   const errors =
-    productData.productUpdate
+    data.productUpdate
       .userErrors || [];
 
   if (errors.length) {
@@ -1201,9 +1195,9 @@ async function updateProduct(
     );
   }
 
-  // 2. Productopties zoals Size/Color.
   for (
-    const option of product.options
+    const option of
+      product.options
   ) {
     const translated =
       translation.options.find(
@@ -1221,11 +1215,14 @@ async function updateProduct(
     }
 
     const optionValuesToUpdate =
-      option.optionValues.nodes
+      option.optionValues
         .map(
           (original) => {
             const match =
-              translated.values?.find(
+              (
+                translated.values ||
+                []
+              ).find(
                 (value) =>
                   String(
                     value.id
@@ -1241,7 +1238,8 @@ async function updateProduct(
 
             const name =
               String(
-                match.name || ""
+                match.name ||
+                  ""
               ).trim();
 
             if (
@@ -1262,26 +1260,25 @@ async function updateProduct(
         )
         .filter(Boolean);
 
-    const translatedOptionName =
+    const optionName =
       String(
-        translated.name || ""
+        translated.name ||
+          ""
       ).trim();
 
-    const optionNameChanged =
-      translatedOptionName &&
-      translatedOptionName !==
+    const nameChanged =
+      optionName &&
+      optionName !==
         option.name.trim();
 
     if (
-      !optionNameChanged &&
+      !nameChanged &&
       optionValuesToUpdate.length ===
         0
     ) {
       continue;
     }
 
-    // Shopify gebruikt hier expliciet
-    // optionValuesToUpdate.
     const optionMutation = `
       mutation UpdateOption(
         $productId: ID!,
@@ -1321,7 +1318,7 @@ async function updateProduct(
               option.id,
 
             name:
-              translatedOptionName ||
+              optionName ||
               option.name,
 
             position:
@@ -1356,7 +1353,7 @@ async function markDone(
   productId
 ) {
   const mutation = `
-    mutation MarkTranslated(
+    mutation MarkDone(
       $metafields: [MetafieldsSetInput!]!
     ) {
       metafieldsSet(
@@ -1418,11 +1415,13 @@ async function runTranslationJob(
   shop
 ) {
   const connection =
-    shopTokens.get(shop);
+    shopTokens.get(
+      shop
+    );
 
   if (!connection) {
     throw new Error(
-      "Shopify is niet verbonden."
+      "Shopify-token ontbreekt."
     );
   }
 
@@ -1441,7 +1440,7 @@ async function runTranslationJob(
   job.logs = [];
 
   try {
-    addLog(
+    log(
       "Productcatalogus ophalen..."
     );
 
@@ -1454,9 +1453,6 @@ async function runTranslationJob(
     job.total =
       products.length;
 
-    // Alle huidige titels worden gereserveerd.
-    // Een nieuw Frans product mag nooit
-    // exact dezelfde titel krijgen.
     const reservedTitles =
       new Set(
         products
@@ -1472,9 +1468,7 @@ async function runTranslationJob(
     const pending =
       products.filter(
         (product) =>
-          !isAlreadyTranslated(
-            product
-          )
+          !isDone(product)
       );
 
     job.pending =
@@ -1484,12 +1478,12 @@ async function runTranslationJob(
       products.length -
       pending.length;
 
-    addLog(
+    log(
       `${products.length} producten gevonden.`
     );
 
-    addLog(
-      `${pending.length} producten moeten nog vertaald worden.`
+    log(
+      `${pending.length} producten moeten nog verwerkt worden.`
     );
 
     let cursor = 0;
@@ -1523,18 +1517,18 @@ async function runTranslationJob(
         };
 
         try {
-          addLog(
+          log(
             `Start ${index + 1}/${pending.length}: ${product.title}`
           );
 
           const translation =
-            await makeTranslation(
+            await translateProduct(
               product,
               reservedTitles,
               index
             );
 
-          addLog(
+          log(
             `Nieuwe naam: ${translation.title}`
           );
 
@@ -1545,8 +1539,6 @@ async function runTranslationJob(
             translation
           );
 
-          // Alleen wanneer alle updates
-          // gelukt zijn, markeren als klaar.
           await markDone(
             shop,
             connection.accessToken,
@@ -1555,8 +1547,8 @@ async function runTranslationJob(
 
           job.processed++;
 
-          addLog(
-            `Klaar: ${translation.title}`
+          log(
+            `KLAAR ${index + 1}/${pending.length}: ${translation.title}`
           );
         } catch (error) {
           job.failed++;
@@ -1575,7 +1567,7 @@ async function runTranslationJob(
             job.errors.shift();
           }
 
-          addLog(
+          log(
             `FOUT: ${message}`
           );
         } finally {
@@ -1584,16 +1576,16 @@ async function runTranslationJob(
       }
     }
 
-    // Drie workers voor snelheid zonder
-    // onnodig agressieve paralleliteit.
     await Promise.all([
       worker(1),
       worker(2),
       worker(3),
+      worker(4),
+      worker(5),
     ]);
 
-    addLog(
-      `VERTAALJOB KLAAR — ${job.processed} verwerkt, ${job.skipped} overgeslagen, ${job.failed} fouten.`
+    log(
+      `JOB KLAAR — verwerkt: ${job.processed}, overgeslagen: ${job.skipped}, fouten: ${job.failed}.`
     );
   } catch (error) {
     job.failed++;
@@ -1602,7 +1594,7 @@ async function runTranslationJob(
       error.message
     );
 
-    addLog(
+    log(
       `JOB FOUT: ${error.message}`
     );
   } finally {
@@ -1616,10 +1608,10 @@ async function runTranslationJob(
 app.get(
   "/",
   (req, res) => {
-    res.send(`
-      <h1>Maison Lévara Paris</h1>
-      <p>Shopify API connection is online.</p>
-    `);
+    res.send(
+      `<h1>Maison Lévara Paris</h1>
+       <p>Shopify API connection is online.</p>`
+    );
   }
 );
 
@@ -1657,7 +1649,7 @@ app.get(
       req.query.shop;
 
     if (
-      !validShop(shop)
+      !isValidShop(shop)
     ) {
       return res
         .status(400)
@@ -1694,7 +1686,7 @@ app.get(
       }
     );
 
-    const url =
+    const authUrl =
       `https://${shop}/admin/oauth/authorize?` +
       new URLSearchParams({
         client_id:
@@ -1709,7 +1701,9 @@ app.get(
         state,
       }).toString();
 
-    res.redirect(url);
+    res.redirect(
+      authUrl
+    );
   }
 );
 
@@ -1723,7 +1717,7 @@ app.get(
     } = req.query;
 
     if (
-      !validShop(shop)
+      !isValidShop(shop)
     ) {
       return res
         .status(400)
@@ -1821,22 +1815,24 @@ app.get(
         }
       );
 
-      const sessionId =
-        createSession(
-          shop
-        );
-
-      res.setHeader(
-        "Set-Cookie",
-        `ml_session=${encodeURIComponent(
-          sessionId
-        )}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400`
+      setSession(
+        res,
+        shop
       );
 
       res.send(`
         <h1>Shopify succesvol verbonden!</h1>
-        <p>Shop: ${shop}</p>
-        <p>Scope: ${data.scope}</p>
+
+        <p>
+          Shop:
+          ${shop}
+        </p>
+
+        <p>
+          Scope:
+          ${data.scope}
+        </p>
+
         <p>
           <a href="/admin?shop=${encodeURIComponent(
             shop
@@ -1866,7 +1862,7 @@ app.get(
       req.query.shop;
 
     if (
-      !validShop(shop)
+      !isValidShop(shop)
     ) {
       return res
         .status(400)
@@ -1899,36 +1895,42 @@ app.get(
         count:
           products.length,
 
-        products:
-          products.slice(
-            0,
-            10
-          ).map(
-            (product) => ({
-              id:
-                product.id,
+        sample:
+          products
+            .slice(
+              0,
+              10
+            )
+            .map(
+              (product) => ({
+                id:
+                  product.id,
 
-              title:
-                product.title,
+                title:
+                  product.title,
 
-              handle:
-                product.handle,
+                handle:
+                  product.handle,
 
-              options:
-                product.options.map(
-                  (option) => ({
-                    name:
-                      option.name,
+                options:
+                  product.options.map(
+                    (
+                      option
+                    ) => ({
+                      name:
+                        option.name,
 
-                    values:
-                      option.optionValues.nodes.map(
-                        (value) =>
-                          value.name
-                      ),
-                  })
-                ),
-            })
-          ),
+                      values:
+                        option.optionValues.map(
+                          (
+                            value
+                          ) =>
+                            value.name
+                        ),
+                    })
+                  ),
+              })
+            ),
       });
     } catch (error) {
       console.error(
@@ -1952,7 +1954,7 @@ app.get(
       req.query.shop;
 
     if (
-      !validShop(shop)
+      !isValidShop(shop)
     ) {
       return res
         .status(400)
@@ -1968,7 +1970,7 @@ app.get(
       return res
         .status(403)
         .send(
-          "Geen geldige Shopify-sessie. Open eerst /auth?shop=..."
+          "Geen geldige sessie. Open eerst /auth?shop=..."
         );
     }
 
@@ -2103,21 +2105,24 @@ pre{
 <div class="card">
 
 <p>
-  Deze job verwerkt
-  alle nog niet vertaalde producten.
+  Alle nog niet verwerkte producten
+  worden naar Frans vertaald.
 </p>
 
 <p>
-  Prijzen, voorraad,
-  SKU's, afbeeldingen
-  en handles worden
-  niet gewijzigd.
+  Producttitel, beschrijving, SEO,
+  optie-namen, maten en kleuren
+  worden verwerkt.
 </p>
 
 <p>
-  Producttitels worden
-  uniek gegenereerd in
-  de structuur:
+  Prijzen, voorraad, SKU's,
+  afbeeldingen en handles
+  worden niet gewijzigd.
+</p>
+
+<p>
+  Producttitels volgen:
   <strong>
     Franse voornaam |
     Franse productomschrijving
@@ -2150,14 +2155,14 @@ Wachten...
 const shop =
   ${JSON.stringify(shop)};
 
-const start =
+const button =
   document.getElementById(
     "start"
   );
 
-async function refresh() {
+async function refresh(){
 
-  try {
+  try{
 
     const response =
       await fetch(
@@ -2216,10 +2221,10 @@ async function refresh() {
         "\\n"
       );
 
-    start.disabled =
+    button.disabled =
       data.running;
 
-  } catch (error) {
+  } catch(error){
 
     console.error(
       error
@@ -2228,10 +2233,10 @@ async function refresh() {
   }
 }
 
-start.onclick =
-  async () => {
+button.onclick =
+  async function(){
 
-    start.disabled =
+    button.disabled =
       true;
 
     const response =
@@ -2256,21 +2261,23 @@ start.onclick =
     const data =
       await response.json();
 
-    if (!response.ok) {
+    if(
+      !response.ok
+    ){
 
       alert(
         data.error ||
         "Starten mislukt."
       );
 
-      start.disabled =
+      button.disabled =
         false;
 
       return;
     }
 
     alert(
-      "Vertaaljob gestart. Laat dit tabblad open."
+      "De vertaaljob is gestart."
     );
 
     refresh();
@@ -2288,18 +2295,18 @@ setInterval(
 </body>
 
 </html>
-`);
+    `);
   }
 );
 
 app.post(
   "/translate-all",
-  async (req, res) => {
+  (req, res) => {
     const shop =
       req.body?.shop;
 
     if (
-      !validShop(shop)
+      !isValidShop(shop)
     ) {
       return res
         .status(400)
@@ -2360,7 +2367,7 @@ app.post(
       shop
     ).catch(
       (error) => {
-        addLog(
+        log(
           `Onverwachte job-fout: ${error.message}`
         );
       }
@@ -2388,7 +2395,7 @@ app.get(
         .status(403)
         .json({
           error:
-            "Geen geldige Shopify-sessie.",
+            "Geen geldige sessie.",
         });
     }
 
@@ -2441,7 +2448,7 @@ if (
   "function"
 ) {
   throw new Error(
-    "Deze server vereist Node.js 18 of nieuwer."
+    "Node.js 18 of nieuwer is vereist."
   );
 }
 
