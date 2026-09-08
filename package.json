@@ -1,0 +1,12 @@
+{
+  "name": "maison-levara-shopify-api",
+  "version": "1.0.0",
+  "description": "Shopify API connection for Maison Lévara Paris",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
