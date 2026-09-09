@@ -1616,6 +1616,12 @@ with existingTitles.
 DESCRIPTION:
 Translate all customer-facing text into French.
 
+NAME CONSISTENCY:
+The returned firstName is the final product name.
+Replace every customer-facing mention of the old product
+name with that exact firstName in descriptionHtml, SEO,
+options and image alt/title text.
+
 Translate tables and size-table text when it is
 inside descriptionHtml.
 
@@ -2048,6 +2054,35 @@ function productPayload(
   };
 }
 
+function replaceProductNameMentions(
+  value,
+  previousName,
+  finalName
+) {
+  const from =
+    String(previousName || "").trim();
+
+  const to =
+    String(finalName || "").trim();
+
+  if (!from || !to || normalize(from) === normalize(to)) {
+    return String(value || "");
+  }
+
+  const escaped =
+    from.replace(/[.*+?^$()|[\]\\]/g, "\\$&");
+
+  return String(value || "").replace(
+    new RegExp(
+      "(^|[^\\p{L}\\p{N}])" +
+      escaped +
+      "(?=$|[^\\p{L}\\p{N}])",
+      "giu"
+    ),
+    (_match, prefix) => prefix + to
+  );
+}
+
 function validUniqueTitle(
   title,
   reservedTitles
@@ -2169,11 +2204,29 @@ async function translateProduct(
       continue;
     }
 
+    const previousName =
+      String(product.title || "")
+        .split("|")[0]
+        .trim();
+
     const descriptionHtml =
       restoreHtml(
-        result.descriptionHtml,
+        replaceProductNameMentions(
+          result.descriptionHtml,
+          previousName,
+          firstName
+        ),
         prepared,
-        result.htmlAttributes
+        (result.htmlAttributes || []).map(
+          (attribute) => ({
+            ...attribute,
+            value: replaceProductNameMentions(
+              attribute.value,
+              previousName,
+              firstName
+            ),
+          })
+        )
       );
 
     assertHtmlSafe(
@@ -2194,16 +2247,18 @@ async function translateProduct(
       descriptionHtml,
 
       seoTitle:
-        String(
-          result.seoTitle ||
-            ""
-        ).trim(),
+        replaceProductNameMentions(
+          String(result.seoTitle || "").trim(),
+          previousName,
+          firstName
+        ),
 
       seoDescription:
-        String(
-          result.seoDescription ||
-            ""
-        ).trim(),
+        replaceProductNameMentions(
+          String(result.seoDescription || "").trim(),
+          previousName,
+          firstName
+        ),
 
       options:
         Array.isArray(
@@ -2611,10 +2666,12 @@ async function updateMediaAlt(
    MARK PRODUCT DONE
 ========================================================= */
 
-async function markDone(
+async function setProductMarker(
   shop,
   token,
-  productId
+  productId,
+  key,
+  value
 ) {
   const mutation = `
     mutation MarkDone(
@@ -2647,14 +2704,12 @@ async function markDone(
             namespace:
               "maison_levara",
 
-            key:
-              "fr_translation_v1",
+            key,
 
             type:
               "single_line_text_field",
 
-            value:
-              "done",
+            value,
           },
         ],
       }
@@ -2676,6 +2731,45 @@ async function markDone(
         .join(" | ")
     );
   }
+}
+
+async function markDone(
+  shop,
+  token,
+  productId
+) {
+  await setProductMarker(
+    shop,
+    token,
+    productId,
+    "fr_translation_v1",
+    "done"
+  );
+}
+
+async function markNameConsistencyDone(
+  shop,
+  token,
+  productId
+) {
+  await setProductMarker(
+    shop,
+    token,
+    productId,
+    "fr_name_consistency_v1",
+    "done"
+  );
+}
+
+function hasNameConsistencyDone(
+  product
+) {
+  return product.metafields.nodes.some(
+    (field) =>
+      field.namespace === "maison_levara" &&
+      field.key === "fr_name_consistency_v1" &&
+      field.value === "done"
+  );
 }
 
 function isDone(
@@ -2732,6 +2826,12 @@ async function processProduct(
   );
 
   await markDone(
+    shop,
+    token,
+    product.id
+  );
+
+  await markNameConsistencyDone(
     shop,
     token,
     product.id
@@ -3375,6 +3475,31 @@ async function runFullJob(
    TEST ONE PRODUCT
 ========================================================= */
 
+function productHasBFSizeChart(
+  product,
+  sizeChartValue
+) {
+  const source =
+    String(sizeChartValue || "").toLowerCase();
+
+  return [
+    product.id,
+    product.legacyResourceId,
+    product.handle,
+    product.title,
+  ].some(
+    (value) => {
+      const candidate =
+        String(value || "").trim().toLowerCase();
+
+      return (
+        candidate.length > 3 &&
+        source.includes(candidate)
+      );
+    }
+  );
+}
+
 async function runTestOne(
   shop
 ) {
@@ -3397,22 +3522,6 @@ async function runTestOne(
       connection.accessToken
     );
 
-  const product =
-    products.find(
-      (item) =>
-        !isDone(
-          item
-        )
-    );
-
-  if (
-    !product
-  ) {
-    throw new Error(
-      "Alle producten zijn al gemarkeerd als verwerkt."
-    );
-  }
-
   const reservedTitles =
     new Set(
       products.map(
@@ -3423,14 +3532,80 @@ async function runTestOne(
       )
     );
 
+  /*
+    One-time repair for products processed before the
+    name-consistency rule was added.
+  */
+  for (
+    const completed of products.filter(
+      (item) =>
+        isDone(item) &&
+        !hasNameConsistencyDone(item)
+    )
+  ) {
+    await processProduct(
+      shop,
+      connection.accessToken,
+      completed,
+      reservedTitles,
+      products.indexOf(completed)
+    );
+  }
+
+  const currentProducts =
+    await getAllProducts(
+      shop,
+      connection.accessToken
+    );
+
+  const bf =
+    await getBFSizeCharts(
+      shop,
+      connection.accessToken
+    );
+
+  if (!bf.metafield) {
+    throw new Error(
+      "BF Size Chart niet gevonden."
+    );
+  }
+
+  const product =
+    currentProducts.find(
+      (item) =>
+        !isDone(item) &&
+        productHasBFSizeChart(
+          item,
+          bf.metafield.value
+        )
+    );
+
+  if (!product) {
+    throw new Error(
+      "Geen onverwerkt product met gekoppelde BF Size Chart gevonden."
+    );
+  }
+
   const translated =
     await processProduct(
       shop,
       connection.accessToken,
       product,
       reservedTitles,
-      0
+      currentProducts.indexOf(product)
     );
+
+  await updateBFSizeChart(
+    shop,
+    connection.accessToken,
+    currentProducts,
+    new Map([
+      [
+        normalize(product.title),
+        translated.title,
+      ],
+    ])
+  );
 
   return {
     originalTitle:
