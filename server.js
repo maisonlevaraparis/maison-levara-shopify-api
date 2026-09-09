@@ -2248,7 +2248,6 @@ async function updateProduct(
         userErrors {
           field
           message
-          code
         }
 
         product {
@@ -2435,7 +2434,6 @@ async function updateOptions(
           userErrors {
             field
             message
-            code
           }
 
           product {
@@ -2630,7 +2628,6 @@ async function markDone(
         userErrors {
           field
           message
-          code
         }
       }
     }
@@ -3017,7 +3014,6 @@ async function updateBFSizeChart(
         userErrors {
           field
           message
-          code
         }
       }
     }
