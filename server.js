@@ -4048,6 +4048,50 @@ async function runRecoveryTestOne(shop) {
   }
 }
 
+
+async function runBFRepairOnly(shop) {
+  const connection = tokens.get(shop);
+  if (!connection) throw new Error("Shopify-token ontbreekt.");
+
+  job.running = true;
+  job.mode = "bf-repair";
+  job.shop = shop;
+  job.total = 0;
+  job.pending = 0;
+  job.processed = 0;
+  job.skipped = 0;
+  job.failed = 0;
+  job.current = null;
+  job.startedAt = new Date().toISOString();
+  job.finishedAt = null;
+  job.logs = [];
+  job.errors = [];
+
+  try {
+    log("BF Size Charts ophalen...");
+    const products = await getAllProducts(shop, connection.accessToken);
+    job.total = products.length;
+    job.current = {
+      index: 1,
+      total: 1,
+      title: "BF Size Charts",
+    };
+    await updateBFSizeChart(
+      shop,
+      connection.accessToken,
+      products,
+      new Map()
+    );
+    job.processed = products.length;
+    job.pending = 0;
+    job.current = null;
+    log("BF MAATTABELLEN KLAAR.");
+  } finally {
+    job.running = false;
+    job.finishedAt = new Date().toISOString();
+  }
+}
+
 /* =========================================================
    ROUTES
 ========================================================= */
@@ -4765,6 +4809,10 @@ pre{
   Test herstel 1 product
 </button>
 
+<button id="repairBF">
+  Herstel BF-maattabellen
+</button>
+
 </div>
 
 <div
@@ -4813,6 +4861,11 @@ const repair =
 const repairTest =
   document.getElementById(
     "repairTest"
+  );
+
+const repairBF =
+  document.getElementById(
+    "repairBF"
   );
 
 async function refresh(){
@@ -4956,6 +5009,17 @@ test.onclick =
 
     refresh();
 
+  };
+
+repairBF.onclick =
+  async () => {
+    if (!confirm("Dit vertaalt uitsluitend alle zichtbare BF-maattabelteksten naar Frans. Doorgaan?")) return;
+    repairBF.disabled = true;
+    const response = await fetch("/repair-bf", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ shop }) });
+    const data = await response.json();
+    if (!response.ok) { alert(data.error || "BF-herstel mislukt."); repairBF.disabled = false; return; }
+    alert("BF-herstel is gestart.");
+    refresh();
   };
 
 repairTest.onclick = async () => {
@@ -5198,6 +5262,19 @@ app.post(
    START RECOVERY RUN
 ========================================================= */
 
+
+app.post("/repair-bf", async (req, res) => {
+  const shop = req.body?.shop;
+  if (!validShop(shop)) return res.status(400).json({ error: "Ongeldige shop." });
+  if (getSessionShop(req) !== shop) return res.status(403).json({ error: "Geen geldige sessie." });
+  if (job.running) return res.status(409).json({ error: "Er draait al een job." });
+  runBFRepairOnly(shop).catch((error) => {
+    job.failed++;
+    job.errors.push(error.message);
+    log("BF HERSTEL FOUT: " + error.message);
+  });
+  res.status(202).json({ ok: true });
+});
 
 app.post("/repair-one", async (req, res) => {
   const shop = req.body?.shop;
