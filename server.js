@@ -2873,135 +2873,173 @@ async function processProduct(
    BF TRANSLATION
 ========================================================= */
 
+function splitBFText(
+  value,
+  maxChars = 4000
+) {
+  const text = String(value || "");
+
+  if (text.length <= maxChars) {
+    return [text];
+  }
+
+  const units =
+    text.match(/<[^>]*>|[^<]+/g) ||
+    [text];
+
+  const parts = [];
+  let current = "";
+
+  const pushCurrent = () => {
+    if (current) {
+      parts.push(current);
+      current = "";
+    }
+  };
+
+  for (const unit of units) {
+    if (
+      unit.length <= maxChars &&
+      current.length + unit.length <= maxChars
+    ) {
+      current += unit;
+      continue;
+    }
+
+    if (unit.length <= maxChars) {
+      pushCurrent();
+      current = unit;
+      continue;
+    }
+
+    pushCurrent();
+
+    let remaining = unit;
+
+    while (remaining.length > maxChars) {
+      let cut =
+        remaining.lastIndexOf(
+          " ",
+          maxChars
+        );
+
+      if (cut < maxChars / 2) {
+        cut = maxChars;
+      }
+
+      parts.push(
+        remaining.slice(0, cut)
+      );
+
+      remaining =
+        remaining.slice(cut);
+    }
+
+    current = remaining;
+  }
+
+  pushCurrent();
+
+  return parts;
+}
+
 async function translateBFEntries(
   entries
 ) {
-  const results =
-    new Array(
-      entries.length
-    );
+  const workItems = [];
 
-  /*
-    BF cells can contain long HTML or rich text.
-    Small batches prevent context-window failures
-    while preserving numerical size values.
-  */
-  const chunkSize =
-    3;
+  entries.forEach(
+    (entry, sourceIndex) => {
+      splitBFText(entry.text).forEach(
+        (text, partIndex) => {
+          workItems.push({
+            sourceIndex,
+            partIndex,
+            text,
+          });
+        }
+      );
+    }
+  );
+
+  const translatedParts =
+    new Array(workItems.length);
 
   const schema = {
-    type:
-      "object",
-
-    additionalProperties:
-      false,
-
+    type: "object",
+    additionalProperties: false,
     properties: {
       translations: {
-        type:
-          "array",
-
+        type: "array",
         items: {
-          type:
-            "object",
-
-          additionalProperties:
-            false,
-
+          type: "object",
+          additionalProperties: false,
           properties: {
-            id: {
-              type:
-                "integer",
-            },
-
-            text: {
-              type:
-                "string",
-            },
+            id: { type: "integer" },
+            text: { type: "string" },
           },
-
-          required: [
-            "id",
-            "text",
-          ],
+          required: ["id", "text"],
         },
       },
     },
-
-    required: [
-      "translations",
-    ],
+    required: ["translations"],
   };
 
+  /*
+    One protected BF fragment per request:
+    this prevents a single rich chart field
+    from exceeding the model context limit.
+  */
   for (
-    let start = 0;
-    start <
-      entries.length;
-    start +=
-      chunkSize
+    let index = 0;
+    index < workItems.length;
+    index++
   ) {
-    const chunk =
-      entries.slice(
-        start,
-        start +
-          chunkSize
-      );
+    const item = workItems[index];
 
-    const payload = {
-      items:
-        chunk.map(
-          (
-            item,
-            index
-          ) => ({
-            id:
-              index,
+    const response = await openAIJson(
+      BF_PROMPT,
+      schema,
+      {
+        items: [
+          {
+            id: 0,
+            text: item.text,
+          },
+        ],
+      }
+    );
 
-            text:
-              item.text,
-          })
-        ),
-    };
-
-    const response =
-      await openAIJson(
-        BF_PROMPT,
-        schema,
-        payload
-      );
-
-    for (
-      const item of
-        response.translations ||
-        []
-    ) {
-      const localIndex =
-        Number(
-          item.id
+    const translation =
+      (response.translations || [])
+        .find(
+          (candidate) =>
+            Number(candidate.id) === 0
         );
 
-      if (
-        Number.isInteger(
-          localIndex
-        ) &&
-        localIndex >=
-          0 &&
-        localIndex <
-          chunk.length
-      ) {
-        results[
-          start +
-            localIndex
-        ] =
-          String(
-            item.text ||
-              ""
-          );
-      }
-    }
+    translatedParts[index] =
+      String(
+        translation?.text ||
+          item.text
+      );
   }
 
-  return results;
+  const perEntry =
+    entries.map(() => []);
+
+  workItems.forEach(
+    (item, index) => {
+      perEntry[item.sourceIndex][
+        item.partIndex
+      ] = translatedParts[index];
+    }
+  );
+
+  return entries.map(
+    (entry, index) =>
+      perEntry[index].join("") ||
+      entry.text
+  );
 }
 
 async function updateBFSizeChart(
