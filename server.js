@@ -3965,6 +3965,51 @@ async function runRecoveryJob(
   }
 }
 
+
+async function runRecoveryTestOne(shop) {
+  const connection = tokens.get(shop);
+  if (!connection) throw new Error("Shopify-token ontbreekt.");
+
+  job.running = true;
+  job.mode = "repair-test";
+  job.shop = shop;
+  job.processed = 0;
+  job.skipped = 0;
+  job.failed = 0;
+  job.startedAt = new Date().toISOString();
+  job.finishedAt = null;
+  job.logs = [];
+  job.errors = [];
+
+  try {
+    const products = await getAllProducts(shop, connection.accessToken);
+    const product = products.find((item) => !isDone(item)) || products[0];
+    if (!product) throw new Error("Geen producten gevonden.");
+
+    job.total = 1;
+    job.pending = 1;
+    job.current = { index: 1, total: 1, title: product.title };
+
+    if (!isDone(product)) {
+      const reservedTitles = new Set(products.map((item) => normalize(item.title)));
+      await processProduct(shop, connection.accessToken, product, reservedTitles, products.indexOf(product));
+    }
+
+    const refreshed = (await getAllProducts(shop, connection.accessToken))
+      .find((item) => item.id === product.id) || product;
+    const updated = await repairProductIdentity(shop, connection.accessToken, refreshed);
+
+    job.processed = 1;
+    job.pending = 0;
+    job.current = null;
+    log("HERSTELTEST KLAAR: " + product.title + " -> " + updated.title);
+    return { originalTitle: product.title, newTitle: updated.title };
+  } finally {
+    job.running = false;
+    job.finishedAt = new Date().toISOString();
+  }
+}
+
 /* =========================================================
    ROUTES
 ========================================================= */
@@ -4866,6 +4911,16 @@ test.onclick =
 
   };
 
+repairTest.onclick = async () => {
+  if (!confirm("De hersteltest past één product aan: productnaam, naam in beschrijving en verkoper. Doorgaan?")) return;
+  repairTest.disabled = true;
+  const response = await fetch("/repair-one", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ shop }) });
+  const data = await response.json();
+  if (!response.ok) { alert(data.error || "Hersteltest mislukt."); repairTest.disabled = false; return; }
+  alert("Hersteltest klaar: " + data.newTitle);
+  refresh();
+};
+
 repair.onclick =
   async () => {
 
@@ -5084,6 +5139,23 @@ app.post(
 /* =========================================================
    START RECOVERY RUN
 ========================================================= */
+
+
+app.post("/repair-one", async (req, res) => {
+  const shop = req.body?.shop;
+  if (!validShop(shop)) return res.status(400).json({ error: "Ongeldige shop." });
+  if (getSessionShop(req) !== shop) return res.status(403).json({ error: "Geen geldige sessie." });
+  if (job.running) return res.status(409).json({ error: "Er draait al een job." });
+  try {
+    const result = await runRecoveryTestOne(shop);
+    res.json({ ok: true, originalTitle: result.originalTitle, newTitle: result.newTitle });
+  } catch (error) {
+    job.failed++;
+    job.errors.push(error.message);
+    log("HERSTELTEST FOUT: " + error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 app.post(
   "/repair-all",
