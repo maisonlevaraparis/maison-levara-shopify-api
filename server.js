@@ -4723,6 +4723,10 @@ pre{
   Start herstelrun
 </button>
 
+<button id="repairTest">
+  Test herstel 1 product
+</button>
+
 </div>
 
 <div
@@ -4766,6 +4770,11 @@ const start =
 const repair =
   document.getElementById(
     "repair"
+  );
+
+const repairTest =
+  document.getElementById(
+    "repairTest"
   );
 
 async function refresh(){
@@ -4920,6 +4929,17 @@ repairTest.onclick = async () => {
   alert("Hersteltest klaar: " + data.newTitle);
   refresh();
 };
+
+repairTest.onclick =
+  async () => {
+    if (!confirm("De hersteltest past één product aan: productnaam, naam in beschrijving en verkoper. Doorgaan?")) return;
+    repairTest.disabled = true;
+    const response = await fetch("/repair-one", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ shop }) });
+    const data = await response.json();
+    if (!response.ok) { alert(data.error || "Hersteltest mislukt."); repairTest.disabled = false; return; }
+    alert("Hersteltest klaar: " + data.newTitle);
+    refresh();
+  };
 
 repair.onclick =
   async () => {
