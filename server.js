@@ -387,8 +387,6 @@ async function shopifyGraphQL(
           }
         );
 
-      clearTimeout(requestTimeout);
-
       const body =
         await response.json();
 
