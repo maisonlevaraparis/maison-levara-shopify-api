@@ -1,17 +1,12 @@
 {
-  "name": "shopify-france-translator",
+  "name": "maison-levara-shopify-api",
   "version": "1.0.0",
-  "private": true,
-  "type": "commonjs",
+  "description": "Shopify API connection for Maison Lévara Paris",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=20"
-  },
   "dependencies": {
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2",
-    "openai": "^4.86.2"
+    "express": "^5.1.0"
   }
 }
