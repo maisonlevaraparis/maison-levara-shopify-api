@@ -2881,8 +2881,13 @@ async function translateBFEntries(
       entries.length
     );
 
+  /*
+    BF cells can contain long HTML or rich text.
+    Small batches prevent context-window failures
+    while preserving numerical size values.
+  */
   const chunkSize =
-    30;
+    3;
 
   const schema = {
     type:
@@ -3645,6 +3650,321 @@ async function runTestOne(
   };
 }
 
+
+/* =========================================================
+   RECOVERY RUN
+========================================================= */
+
+const NAME_REPAIR_SCHEMA = {
+  type: "object",
+
+  additionalProperties: false,
+
+  properties: {
+    firstName: {
+      type: "string",
+    },
+  },
+
+  required: [
+    "firstName",
+  ],
+};
+
+const NAME_REPAIR_PROMPT = \`
+Read the already French product description and return
+only the exact customer-facing product first name used
+inside that description.
+
+This name is authoritative because it matches the
+product's gender and identity. Copy its spelling and
+accents exactly. Do not invent, translate, or change it.
+
+If the description has no product name, return the
+first name already present in currentTitle.
+
+Return JSON only.
+\`;
+
+function productDescriptor(title) {
+  const parts =
+    String(title || "")
+      .split("|");
+
+  return parts
+    .slice(1)
+    .join("|")
+    .trim();
+}
+
+async function updateProductIdentityAndVendor(
+  shop,
+  token,
+  product,
+  title
+) {
+  const mutation = \`
+    mutation UpdateProductIdentity(
+      $product: ProductUpdateInput!
+    ) {
+      productUpdate(
+        product: $product
+      ) {
+        userErrors {
+          field
+          message
+        }
+        product {
+          id
+          title
+          vendor
+        }
+      }
+    }
+  \`;
+
+  const data =
+    await shopifyGraphQL(
+      shop,
+      token,
+      mutation,
+      {
+        product: {
+          id: product.id,
+          title,
+          vendor: "Maison Lévara Paris",
+        },
+      }
+    );
+
+  const errors =
+    data.productUpdate
+      .userErrors || [];
+
+  if (errors.length) {
+    throw new Error(
+      errors
+        .map((error) => error.message)
+        .join(" | ")
+    );
+  }
+
+  return data.productUpdate.product;
+}
+
+async function repairProductIdentity(
+  shop,
+  token,
+  product
+) {
+  const currentFirstName =
+    String(product.title || "")
+      .split("|")[0]
+      .trim();
+
+  const result =
+    await openAIJson(
+      NAME_REPAIR_PROMPT,
+      NAME_REPAIR_SCHEMA,
+      {
+        currentTitle: product.title,
+        descriptionHtml:
+          product.descriptionHtml || "",
+      }
+    );
+
+  const firstName =
+    String(
+      result.firstName ||
+      currentFirstName
+    )
+      .replace(/[|<>{}]/g, "")
+      .trim() ||
+    currentFirstName;
+
+  const descriptor =
+    productDescriptor(
+      product.title
+    );
+
+  const title =
+    descriptor
+      ? \`\${firstName} | \${descriptor}\`
+      : firstName;
+
+  return updateProductIdentityAndVendor(
+    shop,
+    token,
+    product,
+    title
+  );
+}
+
+async function runRecoveryJob(
+  shop
+) {
+  const connection =
+    tokens.get(shop);
+
+  if (!connection) {
+    throw new Error(
+      "Shopify-token ontbreekt."
+    );
+  }
+
+  job.running = true;
+  job.mode = "repair";
+  job.shop = shop;
+  job.total = 0;
+  job.pending = 0;
+  job.processed = 0;
+  job.skipped = 0;
+  job.failed = 0;
+  job.current = null;
+  job.startedAt =
+    new Date().toISOString();
+  job.finishedAt = null;
+  job.logs = [];
+  job.errors = [];
+
+  try {
+    log("Herstelcatalogus ophalen...");
+
+    let products =
+      await getAllProducts(
+        shop,
+        connection.accessToken
+      );
+
+    const failedProducts =
+      products.filter(
+        (product) =>
+          !isDone(product)
+      );
+
+    if (failedProducts.length) {
+      log(
+        \`\${failedProducts.length} foutproducten opnieuw verwerken.\`
+      );
+
+      const reservedTitles =
+        new Set(
+          products.map(
+            (product) =>
+              normalize(product.title)
+          )
+        );
+
+      for (
+        let index = 0;
+        index < failedProducts.length;
+        index++
+      ) {
+        const product =
+          failedProducts[index];
+
+        job.current = {
+          index: index + 1,
+          total: failedProducts.length,
+          title: product.title,
+        };
+
+        try {
+          await processProduct(
+            shop,
+            connection.accessToken,
+            product,
+            reservedTitles,
+            products.indexOf(product)
+          );
+          log(
+            \`FOUTPRODUCT KLAAR: \${product.title}\`
+          );
+        } catch (error) {
+          job.failed++;
+          log(
+            \`FOUTPRODUCT FOUT: \${product.title}: \${error.message}\`
+          );
+        }
+      }
+    }
+
+    products =
+      await getAllProducts(
+        shop,
+        connection.accessToken
+      );
+
+    job.total = products.length;
+    job.pending = products.length;
+
+    for (
+      let index = 0;
+      index < products.length;
+      index++
+    ) {
+      const product = products[index];
+
+      job.current = {
+        index: index + 1,
+        total: products.length,
+        title: product.title,
+      };
+
+      try {
+        const updated =
+          await repairProductIdentity(
+            shop,
+            connection.accessToken,
+            product
+          );
+
+        job.processed++;
+        log(
+          \`HERSTEL KLAAR \${index + 1}/\${products.length}: \${product.title} -> \${updated.title}\`
+        );
+      } catch (error) {
+        job.failed++;
+        log(
+          \`HERSTEL FOUT \${index + 1}/\${products.length}: \${product.title}: \${error.message}\`
+        );
+      }
+    }
+
+    /*
+      Re-run BF translation after recovery.  The small
+      chunks translate only visible text and preserve
+      numbers, units and technical values.
+    */
+    const updatedProducts =
+      await getAllProducts(
+        shop,
+        connection.accessToken
+      );
+
+    await updateBFSizeChart(
+      shop,
+      connection.accessToken,
+      updatedProducts,
+      new Map()
+    );
+
+    log(
+      \`HERSTELRUN KLAAR — verwerkt: \${job.processed}, fouten: \${job.failed}.\`
+    );
+  } catch (error) {
+    job.failed++;
+    log(
+      \`HERSTELRUN FOUT: \${error.message}\`
+    );
+  } finally {
+    job.running = false;
+    job.current = null;
+    job.finishedAt =
+      new Date().toISOString();
+  }
+}
+
 /* =========================================================
    ROUTES
 ========================================================= */
@@ -4354,6 +4674,10 @@ pre{
   Start alle producten
 </button>
 
+<button id="repair">
+  Start herstelrun
+</button>
+
 </div>
 
 <div
@@ -4392,6 +4716,11 @@ const test =
 const start =
   document.getElementById(
     "start"
+  );
+
+const repair =
+  document.getElementById(
+    "repair"
   );
 
 async function refresh(){
@@ -4464,6 +4793,9 @@ async function refresh(){
     start.disabled =
       data.running;
 
+    repair.disabled =
+      data.running;
+
   }catch(error){
 
     console.error(
@@ -4528,6 +4860,64 @@ test.onclick =
     alert(
       "Testproduct verwerkt: " +
       data.newTitle
+    );
+
+    refresh();
+
+  };
+
+repair.onclick =
+  async () => {
+
+    if(
+      !confirm(
+        "De herstelrun corrigeert productnamen, verkopers, foutproducten en BF-maattabellen. Doorgaan?"
+      )
+    ){
+      return;
+    }
+
+    repair.disabled =
+      true;
+
+    const response =
+      await fetch(
+        "/repair-all",
+        {
+          method:
+            "POST",
+
+          headers:{
+            "Content-Type":
+              "application/json"
+          },
+
+          body:
+            JSON.stringify({
+              shop
+            })
+        }
+      );
+
+    const data =
+      await response.json();
+
+    if(
+      !response.ok
+    ){
+      alert(
+        data.error ||
+        "Herstelrun mislukt."
+      );
+
+      repair.disabled =
+        false;
+
+      return;
+    }
+
+    alert(
+      "De herstelrun is gestart."
     );
 
     refresh();
@@ -4687,6 +5077,67 @@ app.post(
             error.message,
         });
     }
+  }
+);
+
+
+/* =========================================================
+   START RECOVERY RUN
+========================================================= */
+
+app.post(
+  "/repair-all",
+  (
+    req,
+    res
+  ) => {
+    const shop =
+      req.body?.shop;
+
+    if (
+      !validShop(shop)
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "Ongeldige shop."
+        });
+    }
+
+    if (
+      getSessionShop(req) !==
+      shop
+    ) {
+      return res
+        .status(403)
+        .json({
+          error:
+            "Geen geldige sessie."
+        });
+    }
+
+    if (job.running) {
+      return res
+        .status(409)
+        .json({
+          error:
+            "Er draait al een job."
+        });
+    }
+
+    runRecoveryJob(shop)
+      .catch((error) => {
+        log(
+          \`Onverwachte herstelfout: \${error.message}\`
+        );
+      });
+
+    res
+      .status(202)
+      .json({
+        ok: true,
+      });
   }
 );
 
