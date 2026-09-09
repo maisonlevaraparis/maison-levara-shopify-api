@@ -1082,6 +1082,12 @@ const FRENCH_NAMES = [
   "Zoé",
 ];
 
+/* One-time correction for the product already tested before
+   name consistency was enforced. */
+const LEGACY_PRODUCT_NAMES = {
+  oliver0052: "Oliver",
+};
+
 const FRENCH_NAME_KEYS =
   new Set(
     FRENCH_NAMES.map(
@@ -2209,22 +2215,32 @@ async function translateProduct(
         .split("|")[0]
         .trim();
 
+    const namesToReplace =
+      [
+        previousName,
+        LEGACY_PRODUCT_NAMES[product.handle],
+      ].filter(Boolean);
+
+    const replaceNames =
+      (value) =>
+        namesToReplace.reduce(
+          (current, name) =>
+            replaceProductNameMentions(
+              current,
+              name,
+              firstName
+            ),
+          String(value || "")
+        );
+
     const descriptionHtml =
       restoreHtml(
-        replaceProductNameMentions(
-          result.descriptionHtml,
-          previousName,
-          firstName
-        ),
+        replaceNames(result.descriptionHtml),
         prepared,
         (result.htmlAttributes || []).map(
           (attribute) => ({
             ...attribute,
-            value: replaceProductNameMentions(
-              attribute.value,
-              previousName,
-              firstName
-            ),
+            value: replaceNames(attribute.value),
           })
         )
       );
@@ -2247,17 +2263,13 @@ async function translateProduct(
       descriptionHtml,
 
       seoTitle:
-        replaceProductNameMentions(
-          String(result.seoTitle || "").trim(),
-          previousName,
-          firstName
+        replaceNames(
+          String(result.seoTitle || "").trim()
         ),
 
       seoDescription:
-        replaceProductNameMentions(
-          String(result.seoDescription || "").trim(),
-          previousName,
-          firstName
+        replaceNames(
+          String(result.seoDescription || "").trim()
         ),
 
       options:
@@ -2769,6 +2781,23 @@ function hasNameConsistencyDone(
       field.namespace === "maison_levara" &&
       field.key === "fr_name_consistency_v1" &&
       field.value === "done"
+  );
+}
+
+function needsNameConsistencyRepair(
+  product
+) {
+  const legacyName =
+    LEGACY_PRODUCT_NAMES[product.handle];
+
+  return (
+    !hasNameConsistencyDone(product) ||
+    (
+      legacyName &&
+      String(product.descriptionHtml || "")
+        .toLowerCase()
+        .includes(legacyName.toLowerCase())
+    )
   );
 }
 
@@ -3540,7 +3569,7 @@ async function runTestOne(
     const completed of products.filter(
       (item) =>
         isDone(item) &&
-        !hasNameConsistencyDone(item)
+        needsNameConsistencyRepair(item)
     )
   ) {
     await processProduct(
