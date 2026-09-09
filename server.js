@@ -367,7 +367,6 @@ async function shopifyGraphQL(
         await fetch(
           `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
           {
-            signal: controller.signal,
 
             method:
               "POST",
@@ -1804,6 +1803,8 @@ async function openAIJson(
         await fetch(
           "https://api.openai.com/v1/responses",
           {
+            signal: controller.signal,
+
             method:
               "POST",
 
@@ -1877,6 +1878,8 @@ async function openAIJson(
               }),
           }
         );
+
+      clearTimeout(requestTimeout);
 
       const body =
         await response.json();
