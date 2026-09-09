@@ -3671,7 +3671,7 @@ const NAME_REPAIR_SCHEMA = {
   ],
 };
 
-const NAME_REPAIR_PROMPT = \`
+const NAME_REPAIR_PROMPT = `
 Read the already French product description and return
 only the exact customer-facing product first name used
 inside that description.
@@ -3684,7 +3684,7 @@ If the description has no product name, return the
 first name already present in currentTitle.
 
 Return JSON only.
-\`;
+`;
 
 function productDescriptor(title) {
   const parts =
@@ -3703,7 +3703,7 @@ async function updateProductIdentityAndVendor(
   product,
   title
 ) {
-  const mutation = \`
+  const mutation = `
     mutation UpdateProductIdentity(
       $product: ProductUpdateInput!
     ) {
@@ -3721,7 +3721,7 @@ async function updateProductIdentityAndVendor(
         }
       }
     }
-  \`;
+  `;
 
   const data =
     await shopifyGraphQL(
@@ -3789,7 +3789,7 @@ async function repairProductIdentity(
 
   const title =
     descriptor
-      ? \`\${firstName} | \${descriptor}\`
+      ? `${firstName} | ${descriptor}`
       : firstName;
 
   return updateProductIdentityAndVendor(
@@ -3844,7 +3844,7 @@ async function runRecoveryJob(
 
     if (failedProducts.length) {
       log(
-        \`\${failedProducts.length} foutproducten opnieuw verwerken.\`
+        `${failedProducts.length} foutproducten opnieuw verwerken.`
       );
 
       const reservedTitles =
@@ -3878,12 +3878,12 @@ async function runRecoveryJob(
             products.indexOf(product)
           );
           log(
-            \`FOUTPRODUCT KLAAR: \${product.title}\`
+            `FOUTPRODUCT KLAAR: ${product.title}`
           );
         } catch (error) {
           job.failed++;
           log(
-            \`FOUTPRODUCT FOUT: \${product.title}: \${error.message}\`
+            `FOUTPRODUCT FOUT: ${product.title}: ${error.message}`
           );
         }
       }
@@ -3921,12 +3921,12 @@ async function runRecoveryJob(
 
         job.processed++;
         log(
-          \`HERSTEL KLAAR \${index + 1}/\${products.length}: \${product.title} -> \${updated.title}\`
+          `HERSTEL KLAAR ${index + 1}/${products.length}: ${product.title} -> ${updated.title}`
         );
       } catch (error) {
         job.failed++;
         log(
-          \`HERSTEL FOUT \${index + 1}/\${products.length}: \${product.title}: \${error.message}\`
+          `HERSTEL FOUT ${index + 1}/${products.length}: ${product.title}: ${error.message}`
         );
       }
     }
@@ -3950,12 +3950,12 @@ async function runRecoveryJob(
     );
 
     log(
-      \`HERSTELRUN KLAAR — verwerkt: \${job.processed}, fouten: \${job.failed}.\`
+      `HERSTELRUN KLAAR — verwerkt: ${job.processed}, fouten: ${job.failed}.`
     );
   } catch (error) {
     job.failed++;
     log(
-      \`HERSTELRUN FOUT: \${error.message}\`
+      `HERSTELRUN FOUT: ${error.message}`
     );
   } finally {
     job.running = false;
@@ -5129,7 +5129,7 @@ app.post(
     runRecoveryJob(shop)
       .catch((error) => {
         log(
-          \`Onverwachte herstelfout: \${error.message}\`
+          `Onverwachte herstelfout: ${error.message}`
         );
       });
 
