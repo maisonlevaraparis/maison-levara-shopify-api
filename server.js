@@ -367,6 +367,8 @@ async function shopifyGraphQL(
         await fetch(
           `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
           {
+            signal: controller.signal,
+
             method:
               "POST",
 
@@ -385,6 +387,8 @@ async function shopifyGraphQL(
               }),
           }
         );
+
+      clearTimeout(requestTimeout);
 
       const body =
         await response.json();
@@ -1787,6 +1791,15 @@ async function openAIJson(
     attempt++
   ) {
     try {
+      const controller =
+        new AbortController();
+
+      const requestTimeout =
+        setTimeout(
+          () => controller.abort(),
+          90000
+        );
+
       const response =
         await fetch(
           "https://api.openai.com/v1/responses",
@@ -2986,42 +2999,83 @@ async function translateBFEntries(
   };
 
   /*
-    One protected BF fragment per request:
-    this prevents a single rich chart field
-    from exceeding the model context limit.
+    Fields are split first, then grouped by
+    character budget. This stays below the
+    model context limit without one request
+    per small label.
   */
-  for (
-    let index = 0;
-    index < workItems.length;
-    index++
-  ) {
+  const batches = [];
+  let batch = [];
+  let batchChars = 0;
+  const maxBatchChars = 8000;
+
+  for (let index = 0; index < workItems.length; index++) {
     const item = workItems[index];
+
+    if (
+      batch.length &&
+      batchChars + item.text.length > maxBatchChars
+    ) {
+      batches.push(batch);
+      batch = [];
+      batchChars = 0;
+    }
+
+    batch.push({ ...item, workIndex: index });
+    batchChars += item.text.length;
+  }
+
+  if (batch.length) {
+    batches.push(batch);
+  }
+
+  let complete = 0;
+
+  for (
+    let batchIndex = 0;
+    batchIndex < batches.length;
+    batchIndex++
+  ) {
+    const currentBatch = batches[batchIndex];
 
     const response = await openAIJson(
       BF_PROMPT,
       schema,
       {
-        items: [
-          {
-            id: 0,
+        items: currentBatch.map(
+          (item, id) => ({
+            id,
             text: item.text,
-          },
-        ],
+          })
+        ),
       }
     );
 
-    const translation =
-      (response.translations || [])
-        .find(
-          (candidate) =>
-            Number(candidate.id) === 0
-        );
-
-    translatedParts[index] =
-      String(
-        translation?.text ||
-          item.text
+    const returned =
+      new Map(
+        (response.translations || []).map(
+          (item) => [
+            Number(item.id),
+            String(item.text || ""),
+          ]
+        )
       );
+
+    currentBatch.forEach(
+      (item, id) => {
+        translatedParts[item.workIndex] =
+          returned.get(id) || item.text;
+      }
+    );
+
+    complete += currentBatch.length;
+
+    log(
+      "BF VOORTGANG: " +
+        complete +
+        "/" +
+        workItems.length
+    );
   }
 
   const perEntry =
