@@ -670,6 +670,84 @@ async function getBFSizeCharts(
    BF JSON HELPERS
 ========================================================= */
 
+function applyBFGlossaryToText(value) {
+  const text = String(value || "");
+
+  if (/^(https?:\/\/|mailto:|tel:|gid:\/\/)/i.test(text)) {
+    return text;
+  }
+
+  const terms = [
+    ["Tabella delle taglie", "Guide des tailles"],
+    ["Tabella taglie", "Guide des tailles"],
+    ["Guida alle taglie", "Guide des tailles"],
+    ["Tabella misura", "Tableau des tailles"],
+    ["Taglia unica", "Taille unique"],
+    ["Taglie", "Tailles"],
+    ["Taglia", "Taille"],
+    ["Misure", "Mesures"],
+    ["Misura", "Mesure"],
+    ["Lunghezza", "Longueur"],
+    ["Larghezza", "Largeur"],
+    ["Altezza", "Hauteur"],
+    ["Profondità", "Profondeur"],
+    ["Circonferenza", "Circonférence"],
+    ["Busto", "Poitrine"],
+    ["Torace", "Poitrine"],
+    ["Vita", "Taille"],
+    ["Fianchi", "Hanches"],
+    ["Spalle", "Épaules"],
+    ["Manica", "Manche"],
+    ["Braccio", "Bras"],
+    ["Gamba", "Jambe"],
+    ["Cavallo", "Entrejambe"],
+    ["Piede", "Pied"],
+    ["Colore", "Couleur"],
+    ["Colori", "Couleurs"],
+    ["Donna", "Femme"],
+    ["Uomo", "Homme"],
+    ["Bambino", "Enfant"],
+    ["Scarpe", "Chaussures"],
+    ["Abbigliamento", "Vêtements"],
+    ["Cappello", "Chapeau"],
+    ["Scegli la taglia", "Choisissez la taille"],
+    ["In centimetri", "En centimètres"],
+    ["Centimetri", "Centimètres"],
+    ["Pollici", "Pouces"],
+    ["Nota bene", "Remarque"],
+  ];
+
+  return terms.reduce(
+    (result, pair) =>
+      result.replace(
+        new RegExp(pair[0], "gi"),
+        pair[1]
+      ),
+    text
+  );
+}
+
+function applyBFGlossary(node) {
+  if (Array.isArray(node)) {
+    node.forEach(applyBFGlossary);
+    return;
+  }
+
+  if (!node || typeof node !== "object") {
+    return;
+  }
+
+  for (const [key, value] of Object.entries(node)) {
+    if (typeof value === "string") {
+      if (!shouldSkipBFString(key, value)) {
+        node[key] = applyBFGlossaryToText(value);
+      }
+    } else {
+      applyBFGlossary(value);
+    }
+  }
+}
+
 function shouldSkipBFString(
   key,
   value
@@ -914,6 +992,7 @@ function collectBFTextEntries(
       "string"
     ) {
       if (
+        value.length <= 2000 &&
         !protectedStrings.has(
           normalize(
             value
@@ -3166,6 +3245,8 @@ async function updateBFSizeChart(
         normalize
       ),
     ]);
+
+  applyBFGlossary(updated);
 
   const entries =
     collectBFTextEntries(
