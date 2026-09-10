@@ -992,7 +992,8 @@ function collectBFTextEntries(
       "string"
     ) {
       if (
-        value.length <= 2000 &&
+        value.length <= 500 &&
+        !/[<{]/.test(value) &&
         !protectedStrings.has(
           normalize(
             value
@@ -2396,6 +2397,36 @@ async function updateProduct(
   product,
   translated
 ) {
+  const originalBytes =
+    Buffer.byteLength(
+      bf.metafield.value,
+      "utf8"
+    );
+
+  const serializedValue =
+    JSON.stringify(updated);
+
+  const updatedBytes =
+    Buffer.byteLength(
+      serializedValue,
+      "utf8"
+    );
+
+  log(
+    "BF opslaggrootte: " +
+      originalBytes +
+      " -> " +
+      updatedBytes +
+      " bytes."
+  );
+
+  if (updatedBytes > 120000) {
+    throw new Error(
+      "BF Size Chart is na verwerking te groot voor Shopify-opslag. " +
+      "Er is niets opgeslagen."
+    );
+  }
+
   const mutation = `
     mutation UpdateProduct(
       $product: ProductUpdateInput!
@@ -3036,6 +3067,27 @@ function splitBFText(
   return parts;
 }
 
+function keepSafeBFTranslation(
+  original,
+  candidate
+) {
+  const source = String(original || "");
+  const translated = String(candidate || "");
+  const maxLength = Math.max(
+    300,
+    source.length * 2 + 80
+  );
+
+  if (
+    !translated ||
+    translated.length > maxLength
+  ) {
+    return applyBFGlossaryToText(source);
+  }
+
+  return translated;
+}
+
 async function translateBFEntries(
   entries
 ) {
@@ -3144,7 +3196,10 @@ async function translateBFEntries(
     currentBatch.forEach(
       (item, id) => {
         translatedParts[item.workIndex] =
-          returned.get(id) || item.text;
+          keepSafeBFTranslation(
+            item.text,
+            returned.get(id) || item.text
+          );
       }
     );
 
@@ -3348,9 +3403,7 @@ async function updateBFSizeChart(
               bf.metafield.type,
 
             value:
-              JSON.stringify(
-                updated
-              ),
+              serializedValue,
 
             compareDigest:
               bf.metafield
