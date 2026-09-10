@@ -2397,36 +2397,6 @@ async function updateProduct(
   product,
   translated
 ) {
-  const originalBytes =
-    Buffer.byteLength(
-      bf.metafield.value,
-      "utf8"
-    );
-
-  const serializedValue =
-    JSON.stringify(updated);
-
-  const updatedBytes =
-    Buffer.byteLength(
-      serializedValue,
-      "utf8"
-    );
-
-  log(
-    "BF opslaggrootte: " +
-      originalBytes +
-      " -> " +
-      updatedBytes +
-      " bytes."
-  );
-
-  if (updatedBytes > 120000) {
-    throw new Error(
-      "BF Size Chart is na verwerking te groot voor Shopify-opslag. " +
-      "Er is niets opgeslagen."
-    );
-  }
-
   const mutation = `
     mutation UpdateProduct(
       $product: ProductUpdateInput!
@@ -3091,144 +3061,27 @@ function keepSafeBFTranslation(
 async function translateBFEntries(
   entries
 ) {
-  const workItems = [];
-
-  entries.forEach(
-    (entry, sourceIndex) => {
-      splitBFText(entry.text).forEach(
-        (text, partIndex) => {
-          workItems.push({
-            sourceIndex,
-            partIndex,
-            text,
-          });
-        }
-      );
-    }
-  );
-
-  const translatedParts =
-    new Array(workItems.length);
-
-  const schema = {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      translations: {
-        type: "array",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            id: { type: "integer" },
-            text: { type: "string" },
-          },
-          required: ["id", "text"],
-        },
-      },
-    },
-    required: ["translations"],
-  };
-
   /*
-    Fields are split first, then grouped by
-    character budget. This stays below the
-    model context limit without one request
-    per small label.
+    BF labels are translated locally in this run.
+    This avoids further OpenAI charges until
+    Shopify storage has been verified.
   */
-  const batches = [];
-  let batch = [];
-  let batchChars = 0;
-  const maxBatchChars = 8000;
-
-  for (let index = 0; index < workItems.length; index++) {
-    const item = workItems[index];
-
-    if (
-      batch.length &&
-      batchChars + item.text.length > maxBatchChars
-    ) {
-      batches.push(batch);
-      batch = [];
-      batchChars = 0;
-    }
-
-    batch.push({ ...item, workIndex: index });
-    batchChars += item.text.length;
-  }
-
-  if (batch.length) {
-    batches.push(batch);
-  }
-
-  let complete = 0;
-
-  for (
-    let batchIndex = 0;
-    batchIndex < batches.length;
-    batchIndex++
-  ) {
-    const currentBatch = batches[batchIndex];
-
-    const response = await openAIJson(
-      BF_PROMPT,
-      schema,
-      {
-        items: currentBatch.map(
-          (item, id) => ({
-            id,
-            text: item.text,
-          })
-        ),
-      }
-    );
-
-    const returned =
-      new Map(
-        (response.translations || []).map(
-          (item) => [
-            Number(item.id),
-            String(item.text || ""),
-          ]
+  const translated =
+    entries.map(
+      (entry) =>
+        applyBFGlossaryToText(
+          entry.text
         )
-      );
-
-    currentBatch.forEach(
-      (item, id) => {
-        translatedParts[item.workIndex] =
-          keepSafeBFTranslation(
-            item.text,
-            returned.get(id) || item.text
-          );
-      }
     );
 
-    complete += currentBatch.length;
-
-    log(
-      "BF VOORTGANG: " +
-        complete +
-        "/" +
-        workItems.length
-    );
-  }
-
-  const perEntry =
-    entries.map(() => []);
-
-  workItems.forEach(
-    (item, index) => {
-      perEntry[item.sourceIndex][
-        item.partIndex
-      ] = translatedParts[index];
-    }
+  log(
+    "BF VEILIGE VERTALING: " +
+      entries.length +
+      "/" +
+      entries.length
   );
 
-  return entries.map(
-    (entry, index) =>
-      perEntry[index].join("") ||
-      entry.text
-  );
+  return translated;
 }
 
 async function updateBFSizeChart(
@@ -3355,6 +3208,36 @@ async function updateBFSizeChart(
     updated,
     titleMap
   );
+
+  const originalBytes =
+    Buffer.byteLength(
+      bf.metafield.value,
+      "utf8"
+    );
+
+  const serializedValue =
+    JSON.stringify(updated);
+
+  const updatedBytes =
+    Buffer.byteLength(
+      serializedValue,
+      "utf8"
+    );
+
+  log(
+    "BF opslaggrootte: " +
+      originalBytes +
+      " -> " +
+      updatedBytes +
+      " bytes."
+  );
+
+  if (updatedBytes > 120000) {
+    throw new Error(
+      "BF Size Chart is na verwerking te groot voor Shopify-opslag. " +
+      "Er is niets opgeslagen."
+    );
+  }
 
   const mutation = `
     mutation UpdateBF(
